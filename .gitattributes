@@ -1,0 +1,6 @@
+*.STL binary
+*.stl binary
+*.obj text
+*.urdf text
+*.yaml text
+*.launch text
