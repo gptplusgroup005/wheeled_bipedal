@@ -2,6 +2,7 @@
 #include <stddef.h>
 
 #define STEP_WIDTH 16
+#define TREE_STEP_WIDTH 13
 
 static void mat_identity(double m[9]) {
     for (int i = 0; i < 9; ++i) {
@@ -59,6 +60,39 @@ static void axis_angle(const double axis_in[3], double angle, double out[9]) {
     out[6] = z * x * C - y * s;
     out[7] = z * y * C + x * s;
     out[8] = c + z * z * C;
+}
+
+static void rot_x(double a, double out[9]) {
+    double c = cos(a);
+    double s = sin(a);
+    out[0] = 1.0; out[1] = 0.0; out[2] = 0.0;
+    out[3] = 0.0; out[4] = c;   out[5] = -s;
+    out[6] = 0.0; out[7] = s;   out[8] = c;
+}
+
+static void rot_y(double a, double out[9]) {
+    double c = cos(a);
+    double s = sin(a);
+    out[0] = c;   out[1] = 0.0; out[2] = s;
+    out[3] = 0.0; out[4] = 1.0; out[5] = 0.0;
+    out[6] = -s;  out[7] = 0.0; out[8] = c;
+}
+
+static void rot_z(double a, double out[9]) {
+    double c = cos(a);
+    double s = sin(a);
+    out[0] = c;   out[1] = -s;  out[2] = 0.0;
+    out[3] = s;   out[4] = c;   out[5] = 0.0;
+    out[6] = 0.0; out[7] = 0.0; out[8] = 1.0;
+}
+
+static void rpy_matrix(const double rpy[3], double out[9]) {
+    double rx[9], ry[9], rz[9], zy[9];
+    rot_x(rpy[0], rx);
+    rot_y(rpy[1], ry);
+    rot_z(rpy[2], rz);
+    mat_mul(rz, ry, zy);
+    mat_mul(zy, rx, out);
 }
 
 static int angle_for_index(
@@ -226,4 +260,75 @@ int solve_passive_pair_c(
     out[1] = best_b;
     out[2] = best_error;
     return isfinite(best_error) ? 1 : 0;
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int compute_link_transforms_c(
+    const double *tree_steps,
+    int step_count,
+    const double *angles,
+    int angle_count,
+    const double *root_origin,
+    const double *root_rotation,
+    double scale,
+    int link_count,
+    double *out_origins,
+    double *out_rotations
+) {
+    if (!tree_steps || !angles || !root_origin || !root_rotation || !out_origins || !out_rotations || link_count <= 0) {
+        return 0;
+    }
+
+    for (int i = 0; i < link_count; ++i) {
+        out_origins[i * 3 + 0] = 0.0;
+        out_origins[i * 3 + 1] = 0.0;
+        out_origins[i * 3 + 2] = 0.0;
+        mat_identity(out_rotations + (size_t)i * 9);
+    }
+
+    out_origins[0] = root_origin[0];
+    out_origins[1] = root_origin[1];
+    out_origins[2] = root_origin[2];
+    for (int j = 0; j < 9; ++j) {
+        out_rotations[j] = root_rotation[j];
+    }
+
+    for (int i = 0; i < step_count; ++i) {
+        const double *step = tree_steps + (size_t)i * TREE_STEP_WIDTH;
+        int parent = (int)step[0];
+        int child = (int)step[1];
+        if (parent < 0 || parent >= link_count || child < 0 || child >= link_count) {
+            continue;
+        }
+
+        const double *parent_origin = out_origins + (size_t)parent * 3;
+        const double *parent_rot = out_rotations + (size_t)parent * 9;
+        double local_origin[3] = {step[2] * scale, step[3] * scale, step[4] * scale};
+        double world_offset[3];
+        mat_vec(parent_rot, local_origin, world_offset);
+
+        double *child_origin = out_origins + (size_t)child * 3;
+        child_origin[0] = parent_origin[0] + world_offset[0];
+        child_origin[1] = parent_origin[1] + world_offset[1];
+        child_origin[2] = parent_origin[2] + world_offset[2];
+
+        double origin_rpy[3] = {step[5], step[6], step[7]};
+        double joint_rot[9];
+        rpy_matrix(origin_rpy, joint_rot);
+
+        double *child_rot = out_rotations + (size_t)child * 9;
+        mat_mul(parent_rot, joint_rot, child_rot);
+
+        int angle_index = (int)step[11];
+        int movable = (int)step[12];
+        if (movable && angle_index >= 0 && angle_index < angle_count) {
+            double angle_rot[9];
+            axis_angle(step + 8, angles[angle_index], angle_rot);
+            mat_mul(child_rot, angle_rot, child_rot);
+        }
+    }
+
+    return 1;
 }

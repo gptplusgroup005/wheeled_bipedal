@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from fivebar_solver import make_step, solve_passive_pair, solver_status
+from fivebar_solver import compute_link_transforms, make_step, make_tree_step, solve_passive_pair, solver_status
 
 matplotlib.use("TkAgg")
 
@@ -98,31 +98,12 @@ def rot_z(a: float) -> np.ndarray:
     c, s = math.cos(a), math.sin(a)
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
-def normalize(v: Vec3) -> Vec3:
-    n = np.linalg.norm(v)
-    if n < 1e-9:
-        return np.array([0.0, 0.0, 1.0])
-    return v / n
-
 def transform(points: np.ndarray, origin: Vec3, rotation: np.ndarray) -> np.ndarray:
     return points @ rotation.T + origin
 
 def rpy_matrix(rpy: Vec3) -> np.ndarray:
     roll, pitch, yaw = [float(v) for v in rpy]
     return rot_z(yaw) @ rot_y(pitch) @ rot_x(roll)
-
-def axis_angle_matrix(axis: Vec3, angle: float) -> np.ndarray:
-    axis = normalize(np.asarray(axis, dtype=float))
-    x, y, z = axis
-    c, s = math.cos(angle), math.sin(angle)
-    C = 1.0 - c
-    return np.array(
-        [
-            [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
-            [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
-            [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
-        ]
-    )
 
 def parse_vec(text: str | None, fallback: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> np.ndarray:
     if not text:
@@ -331,6 +312,9 @@ class RobotViewApp:
         self.urdf: URDFModel | None = None
         self.urdf_error = ""
         self.solver_chains: dict[str, np.ndarray] = {}
+        self.link_order: list[str] = []
+        self.link_index: dict[str, int] = {}
+        self.tree_steps = np.empty((0, 13), dtype=np.float64)
         self.last_closure_error: dict[str, float] = {"left": 0.0, "right": 0.0}
 
         self.vars: dict[str, tk.Variable] = {}
@@ -381,10 +365,55 @@ class RobotViewApp:
         try:
             self.urdf = load_urdf_model(urdf_path)
             self.solver_chains.clear()
+            self._prepare_c_kinematics()
             self.urdf_error = ""
         except Exception as exc:
             self.urdf = None
             self.urdf_error = f"URDF load failed: {exc}"
+
+    def _prepare_c_kinematics(self) -> None:
+        if self.urdf is None:
+            self.link_order = []
+            self.link_index = {}
+            self.tree_steps = np.empty((0, 13), dtype=np.float64)
+            return
+
+        order = [self.urdf.root_link]
+        ordered_joints: list[URDFJoint] = []
+        seen = {self.urdf.root_link}
+        stack = [self.urdf.root_link]
+        while stack:
+            parent = stack.pop(0)
+            for joint in self.urdf.child_joints.get(parent, []):
+                ordered_joints.append(joint)
+                if joint.child not in seen:
+                    order.append(joint.child)
+                    seen.add(joint.child)
+                    stack.append(joint.child)
+        for name in self.urdf.links:
+            if name not in seen:
+                order.append(name)
+                seen.add(name)
+
+        self.link_order = order
+        self.link_index = {name: index for index, name in enumerate(order)}
+        steps = []
+        for joint in ordered_joints:
+            parent_index = self.link_index[joint.parent]
+            child_index = self.link_index[joint.child]
+            movable = joint.joint_type in {"revolute", "continuous"}
+            steps.append(
+                make_tree_step(
+                    parent_index,
+                    child_index,
+                    joint.origin_xyz,
+                    joint.origin_rpy,
+                    joint.axis,
+                    JOINT_ANGLE_INDEX.get(joint.name, -1),
+                    movable,
+                )
+            )
+        self.tree_steps = np.vstack(steps) if steps else np.empty((0, 13), dtype=np.float64)
 
     def _apply_style(self) -> None:
         style = ttk.Style()
@@ -601,7 +630,10 @@ class RobotViewApp:
 
     def _draw_robot(self) -> None:
         if self.urdf is not None:
-            self._draw_urdf_robot()
+            try:
+                self._draw_urdf_robot()
+            except RuntimeError as exc:
+                self.ax.text(0.0, 0.0, 0.0, str(exc), color="#b91c1c")
             return
         self.ax.text(0.0, 0.0, 0.0, self.urdf_error or "URDF model is not loaded", color="#b91c1c")
 
@@ -777,27 +809,23 @@ class RobotViewApp:
         scale: float,
         joint_angles: dict[str, float] | None = None,
     ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        if self.urdf is None:
+        if self.urdf is None or not self.link_order:
             return {}
-        transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {self.urdf.root_link: (root_origin, root_rotation)}
-        stack = [self.urdf.root_link]
         if joint_angles is None:
             joint_angles = self._urdf_joint_angles()
-        while stack:
-            parent = stack.pop()
-            parent_origin, parent_R = transforms[parent]
-            for joint in self.urdf.child_joints.get(parent, []):
-                joint_origin = parent_origin + (joint.origin_xyz * scale) @ parent_R.T
-                joint_R = parent_R @ rpy_matrix(joint.origin_rpy)
-                angle = joint_angles.get(joint.name, 0.0)
-                if joint.joint_type in {"revolute", "continuous"}:
-                    angle_R = axis_angle_matrix(joint.axis, angle)
-                    child_R = joint_R @ angle_R
-                else:
-                    child_R = joint_R
-                transforms[joint.child] = (joint_origin, child_R)
-                stack.append(joint.child)
-        return transforms
+        angles = np.asarray([joint_angles[name] for name in JOINT_ANGLE_NAMES], dtype=np.float64)
+        origins, rotations = compute_link_transforms(
+            self.tree_steps,
+            angles,
+            root_origin,
+            root_rotation,
+            scale,
+            len(self.link_order),
+        )
+        return {
+            name: (origins[index], rotations[index])
+            for index, name in enumerate(self.link_order)
+        }
 
     def _urdf_world_bounds(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> tuple[np.ndarray, np.ndarray]:
         if self.urdf is None:

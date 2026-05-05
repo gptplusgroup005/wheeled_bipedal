@@ -9,7 +9,7 @@ Interactive Python/Tkinter viewer for a wheeled biped robot exported from URDF. 
 - Lightweight SolidWorks-style primitive rendering instead of per-frame mesh rendering
 - Event-driven redraws with no background simulation loop
 - Per-side 5-bar linkage controls for pad, motor, calf, and wheel joints
-- Passive calf-joint auto-solver with a cached C/ctypes backend and Python fallback
+- C/ctypes kinematics and passive calf-joint solver; Python is used only for UI/display
 - Adjustable body pose, camera, and model scale
 
 ## Requirements
@@ -36,15 +36,15 @@ python robot_sim.py
 
 ```text
 robot_sim.py              Main application
-fivebar_solver.py         ctypes wrapper and Python fallback for the solver
-fivebar_solver.c          C backend for 5-bar loop-closure solving
+fivebar_solver.py         ctypes wrapper for C kinematics and solver
+fivebar_solver.c          C backend for FK and 5-bar loop-closure solving
 robot_urdf/               URDF package and mesh assets
 requirements.txt          Python dependencies
 ```
 
 ## C Solver
 
-`fivebar_solver.py` automatically looks for `build/fivebar_solver.dll` on Windows or `build/libfivebar_solver.so` on Linux/macOS. If a C compiler is available in `PATH`, the app will build it from `fivebar_solver.c`; otherwise it keeps running with the Python fallback.
+`fivebar_solver.py` automatically looks for `build/fivebar_solver.dll` on Windows or `build/libfivebar_solver.so` on Linux/macOS. If a C compiler is available in `PATH`, the app will build it from `fivebar_solver.c`. The viewer requires this C backend for FK and five-bar solving; Python is reserved for UI and rendering.
 
 Manual Windows build with GCC:
 
