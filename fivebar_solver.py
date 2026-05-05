@@ -20,6 +20,7 @@ class SolverStatus:
 
 _STATUS = SolverStatus("python", "C solver not loaded")
 _LIB: ctypes.CDLL | None = None
+_LOAD_ATTEMPTED = False
 
 
 def solver_status() -> SolverStatus:
@@ -104,9 +105,12 @@ def _as_chain(chain: np.ndarray) -> np.ndarray:
 
 
 def _load_c_solver() -> ctypes.CDLL | None:
-    global _LIB, _STATUS
+    global _LIB, _STATUS, _LOAD_ATTEMPTED
     if _LIB is not None:
         return _LIB
+    if _LOAD_ATTEMPTED:
+        return None
+    _LOAD_ATTEMPTED = True
 
     base_dir = Path(__file__).resolve().parent
     source = base_dir / "fivebar_solver.c"
@@ -207,7 +211,7 @@ def _solve_python(
     center_b = initial_b
     search_radius = (upper - lower) / 2.0
 
-    for samples in (25, 21, 17, 13):
+    for samples in (13, 11, 9):
         a_values = np.linspace(max(lower, center_a - search_radius), min(upper, center_a + search_radius), samples)
         b_values = np.linspace(max(lower, center_b - search_radius), min(upper, center_b + search_radius), samples)
         for angle_a in a_values:

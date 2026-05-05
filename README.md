@@ -1,15 +1,16 @@
 # Wheeled Biped Robot 3D Viewer
 
-Interactive Python/Tkinter viewer for a wheeled biped robot exported from URDF. The app focuses on 3D joint display and provides controls for detailed 5-bar linkage pose inspection, body pose, camera view, mesh detail, and telemetry.
+Interactive Python/Tkinter viewer for a wheeled biped robot exported from URDF. The app reads the URDF once at startup, extracts joint geometry and link dimensions, then renders a lightweight CAD-style solid model for responsive 3D joint display.
 
 ## Features
 
 - URDF-based robot rendering from `robot_urdf/urdf/robot.SLDASM.urdf`
-- STL mesh loading for each robot link
+- One-time URDF/STL bounds loading for each robot link
+- Lightweight SolidWorks-style primitive rendering instead of per-frame mesh rendering
+- Event-driven redraws with no background simulation loop
 - Per-side 5-bar linkage controls for pad, motor, calf, and wheel joints
-- Passive calf-joint auto-solver with a C/ctypes backend and Python fallback
-- Adjustable body pose, camera, mesh scale, and mesh detail
-- Optional STL fallback
+- Passive calf-joint auto-solver with a cached C/ctypes backend and Python fallback
+- Adjustable body pose, camera, and model scale
 
 ## Requirements
 
@@ -55,7 +56,7 @@ gcc -O3 -shared -o build\fivebar_solver.dll fivebar_solver.c
 ## Notes
 
 - The app expects the URDF at `robot_urdf/urdf/robot.SLDASM.urdf`.
-- Visual meshes are loaded from `robot_urdf/meshes/*.STL`.
-- The viewer keeps URDF joint origins, axes, and link hierarchy intact; display scale is applied uniformly to the whole model.
+- Visual mesh bounds are loaded from `robot_urdf/meshes/*.STL` once and converted into simple boxes/cylinders for display.
+- The viewer keeps URDF joint origins, axes, and link hierarchy intact; display scale is applied uniformly to the lightweight model.
 - The current focus is static linkage inspection. Map, obstacle, ground grid, and drive simulation logic have been removed for now.
 - Generated cache files and export logs are intentionally ignored by Git.

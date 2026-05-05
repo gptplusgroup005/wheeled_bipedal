@@ -12,7 +12,6 @@ from tkinter import ttk
 import matplotlib
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.colors import to_rgb
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -50,22 +49,10 @@ class RobotState:
     right_wheel: float = 0.0
 
 @dataclass
-class STLMesh:
-    name: str
-    triangles: np.ndarray
-    normals: np.ndarray
-    bounds_min: np.ndarray
-    bounds_max: np.ndarray
-    triangle_count: int
-    scale: float
-    local_min: np.ndarray
-    local_max: np.ndarray
-
-@dataclass
 class MeshVisual:
     path: Path
-    triangles: np.ndarray
-    normals: np.ndarray
+    bounds_min: np.ndarray
+    bounds_max: np.ndarray
     color: tuple[float, float, float, float]
     origin_xyz: np.ndarray
     origin_rpy: np.ndarray
@@ -173,6 +160,12 @@ def box_faces(center: Vec3, size: tuple[float, float, float], rotation: np.ndarr
         pts[[3, 0, 4, 7]],
     ]
 
+def box_faces_from_bounds(bounds_min: Vec3, bounds_max: Vec3, origin: Vec3, rotation: np.ndarray, scale: float) -> list[np.ndarray]:
+    center = (np.asarray(bounds_min, dtype=float) + np.asarray(bounds_max, dtype=float)) * 0.5
+    size = np.maximum((np.asarray(bounds_max, dtype=float) - np.asarray(bounds_min, dtype=float)) * scale, 1e-4)
+    world_center = origin + (center * scale) @ rotation.T
+    return box_faces(world_center, (float(size[0]), float(size[1]), float(size[2])), rotation)
+
 def cylinder_mesh(
     center: Vec3,
     radius: float,
@@ -195,95 +188,7 @@ def cylinder_mesh(
     pts = transform(pts.reshape(-1, 3), np.asarray(center, dtype=float), rotation).reshape(pts.shape)
     return pts[:, :, 0], pts[:, :, 1], pts[:, :, 2]
 
-def oriented_bar_faces(p0: Vec3, p1: Vec3, width: float, thickness: float) -> list[np.ndarray]:
-    p0, p1 = np.asarray(p0), np.asarray(p1)
-    axis = normalize(p1 - p0)
-    helper = np.array([0.0, 0.0, 1.0])
-    if abs(np.dot(axis, helper)) > 0.92:
-        helper = np.array([1.0, 0.0, 0.0])
-    side = normalize(np.cross(axis, helper))
-    up = normalize(np.cross(side, axis))
-    rotation = np.column_stack((axis, side, up))
-    length = float(np.linalg.norm(p1 - p0))
-    center = (p0 + p1) / 2
-    return box_faces(center, (length, width, thickness), rotation)
-
-def load_stl_mesh(path: Path, max_triangles: int = 30000) -> STLMesh:
-    size = path.stat().st_size
-    with path.open("rb") as fh:
-        header = fh.read(80)
-        count_bytes = fh.read(4)
-    if len(count_bytes) != 4:
-        raise ValueError(f"{path.name} is too small to be an STL file")
-
-    binary_count = struct.unpack("<I", count_bytes)[0]
-    looks_binary = 84 + binary_count * 50 == size
-    if looks_binary:
-        dtype = np.dtype(
-            [
-                ("normal", "<f4", (3,)),
-                ("vertices", "<f4", (3, 3)),
-                ("attr", "<u2"),
-            ]
-        )
-        records = np.memmap(path, dtype=dtype, mode="r", offset=84, shape=(binary_count,))
-        all_vertices = records["vertices"].reshape(-1, 3)
-        bounds_min = np.asarray(all_vertices.min(axis=0), dtype=float)
-        bounds_max = np.asarray(all_vertices.max(axis=0), dtype=float)
-        sample_count = min(max_triangles, binary_count)
-        indices = np.linspace(0, binary_count - 1, sample_count, dtype=np.int64)
-        triangles = np.asarray(records["vertices"][indices], dtype=float)
-        del records
-    else:
-        vertices: list[list[float]] = []
-        bounds_min = np.array([math.inf, math.inf, math.inf])
-        bounds_max = np.array([-math.inf, -math.inf, -math.inf])
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                stripped = line.strip()
-                if not stripped.startswith("vertex"):
-                    continue
-                _tag, x, y, z = stripped.split()[:4]
-                vertex = [float(x), float(y), float(z)]
-                vertices.append(vertex)
-                bounds_min = np.minimum(bounds_min, vertex)
-                bounds_max = np.maximum(bounds_max, vertex)
-        if len(vertices) < 3:
-            raise ValueError(f"{path.name} does not contain STL triangles")
-        all_triangles = np.asarray(vertices, dtype=float).reshape(-1, 3, 3)
-        triangle_count = len(all_triangles)
-        sample_count = min(max_triangles, triangle_count)
-        indices = np.linspace(0, triangle_count - 1, sample_count, dtype=np.int64)
-        triangles = all_triangles[indices]
-        binary_count = triangle_count
-
-    center = (bounds_min + bounds_max) / 2
-    extents = bounds_max - bounds_min
-    largest_xy = max(float(extents[0]), float(extents[1]), 1e-9)
-    scale = 2.75 / largest_xy
-    local = (triangles - center) * scale
-    local[:, :, 2] -= local[:, :, 2].min() + 1.70
-    v1 = local[:, 1] - local[:, 0]
-    v2 = local[:, 2] - local[:, 0]
-    normals = np.cross(v1, v2)
-    lengths = np.linalg.norm(normals, axis=1)
-    valid = lengths > 1e-9
-    normals[valid] /= lengths[valid, None]
-    local_min = local.reshape(-1, 3).min(axis=0)
-    local_max = local.reshape(-1, 3).max(axis=0)
-    return STLMesh(
-        name=path.name,
-        triangles=local,
-        normals=normals,
-        bounds_min=bounds_min,
-        bounds_max=bounds_max,
-        triangle_count=int(binary_count),
-        scale=scale,
-        local_min=local_min,
-        local_max=local_max,
-    )
-
-def load_stl_triangles(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_stl_bounds(path: Path) -> tuple[np.ndarray, np.ndarray, int]:
     size = path.stat().st_size
     with path.open("rb") as fh:
         _header = fh.read(80)
@@ -302,30 +207,28 @@ def load_stl_triangles(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, 
             ]
         )
         records = np.memmap(path, dtype=dtype, mode="r", offset=84, shape=(binary_count,))
-        triangles = np.asarray(records["vertices"], dtype=float)
+        vertices = records["vertices"].reshape(-1, 3)
+        bounds_min = np.asarray(vertices.min(axis=0), dtype=float)
+        bounds_max = np.asarray(vertices.max(axis=0), dtype=float)
         del records
-    else:
-        vertices: list[list[float]] = []
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                stripped = line.strip()
-                if not stripped.startswith("vertex"):
-                    continue
-                _tag, x, y, z = stripped.split()[:4]
-                vertices.append([float(x), float(y), float(z)])
-        if len(vertices) < 3:
-            raise ValueError(f"{path.name} does not contain STL triangles")
-        triangles = np.asarray(vertices, dtype=float).reshape(-1, 3, 3)
+        return bounds_min, bounds_max, int(binary_count)
 
-    v1 = triangles[:, 1] - triangles[:, 0]
-    v2 = triangles[:, 2] - triangles[:, 0]
-    normals = np.cross(v1, v2)
-    lengths = np.linalg.norm(normals, axis=1)
-    valid = lengths > 1e-9
-    normals[valid] /= lengths[valid, None]
-    bounds_min = triangles.reshape(-1, 3).min(axis=0)
-    bounds_max = triangles.reshape(-1, 3).max(axis=0)
-    return triangles, normals, bounds_min, bounds_max
+    bounds_min = np.array([math.inf, math.inf, math.inf])
+    bounds_max = np.array([-math.inf, -math.inf, -math.inf])
+    vertex_count = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped.startswith("vertex"):
+                continue
+            _tag, x, y, z = stripped.split()[:4]
+            vertex = np.array([float(x), float(y), float(z)], dtype=float)
+            bounds_min = np.minimum(bounds_min, vertex)
+            bounds_max = np.maximum(bounds_max, vertex)
+            vertex_count += 1
+    if vertex_count < 3:
+        raise ValueError(f"{path.name} does not contain STL vertices")
+    return bounds_min, bounds_max, vertex_count // 3
 
 def load_urdf_model(path: Path) -> URDFModel:
     tree = ET.parse(path)
@@ -364,11 +267,11 @@ def load_urdf_model(path: Path) -> URDFModel:
                 if len(rgba_parts) >= 3:
                     rgba = tuple(rgba_parts[:3])
                 alpha = rgba_parts[3] if len(rgba_parts) >= 4 else 1.0
-            triangles, normals, bounds_min, bounds_max = load_stl_triangles(mesh_path)
-            visuals.append(MeshVisual(mesh_path, triangles, normals, tuple(rgba) + (alpha,), origin_xyz, origin_rpy))
+            bounds_min, bounds_max, source_triangles = load_stl_bounds(mesh_path)
+            visuals.append(MeshVisual(mesh_path, bounds_min, bounds_max, tuple(rgba) + (alpha,), origin_xyz, origin_rpy))
             all_min = np.minimum(all_min, bounds_min)
             all_max = np.maximum(all_max, bounds_max)
-            triangle_count += len(triangles)
+            triangle_count += source_triangles
             mesh_count += 1
         links[link_name] = URDFLink(link_name, visuals)
 
@@ -420,12 +323,11 @@ class RobotViewApp:
         self.root.minsize(1120, 720)
 
         self.state = RobotState()
-        self.running = False
-        self.last_tick = time.perf_counter()
-        self.last_render = 0.0
         self.last_text_update = 0.0
-        self.mesh: STLMesh | None = None
-        self.mesh_error = ""
+        self.redraw_after_id: str | None = None
+        self.camera_initialized = False
+        self.camera_view: tuple[float, float, float] | None = None
+        self.solve_dirty_sides: set[str] = {"left", "right"}
         self.urdf: URDFModel | None = None
         self.urdf_error = ""
         self.solver_chains: dict[str, np.ndarray] = {}
@@ -433,20 +335,16 @@ class RobotViewApp:
 
         self.vars: dict[str, tk.Variable] = {}
         self._build_vars()
-        self._load_robot_mesh()
         self._load_urdf_model()
         self._build_ui()
         self._apply_style()
-        self.draw_scene()
-        self._tick()
+        self.draw_scene(reset_camera=True)
 
     def _build_vars(self) -> None:
         defaults = {
-            "body_h": 1.75,
             "view_span": 4.0,
-            "use_stl": True,
+            "render_style": "Linkage",
             "urdf_scale": 4.0,
-            "urdf_detail": 12000.0,
             "show_joints": True,
             "auto_passive": True,
             "pad_left_deg": 0.0,
@@ -461,9 +359,6 @@ class RobotViewApp:
             "right_calf_b_deg": 0.0,
             "wheel_left_deg": 0.0,
             "wheel_right_deg": 0.0,
-            "mesh_detail": 5000.0,
-            "live_detail": 800.0,
-            "fps": 8.0,
             "mesh_edges": True,
             "camera": "ISO",
             "pitch": 0.0,
@@ -476,20 +371,6 @@ class RobotViewApp:
                 self.vars[key] = tk.StringVar(value=value)
             else:
                 self.vars[key] = tk.DoubleVar(value=value)
-
-    def _load_robot_mesh(self) -> None:
-        base_dir = Path(__file__).resolve().parent
-        candidates = [base_dir / "robot.stl", base_dir / "robot.STL", base_dir / "ver2_full.STL"]
-        stl_path = next((path for path in candidates if path.exists()), None)
-        if stl_path is None:
-            self.mesh_error = "robot.stl not found"
-            return
-        try:
-            self.mesh = load_stl_mesh(stl_path, max_triangles=50000)
-            self.mesh_error = ""
-        except Exception as exc:
-            self.mesh = None
-            self.mesh_error = f"STL load failed: {exc}"
 
     def _load_urdf_model(self) -> None:
         base_dir = Path(__file__).resolve().parent
@@ -530,6 +411,7 @@ class RobotViewApp:
 
         self.fig = Figure(figsize=(9, 7), dpi=100, facecolor="#eef1f5")
         self.ax = self.fig.add_subplot(111, projection="3d")
+        self.ax.set_proj_type("ortho")
         self.canvas = FigureCanvasTkAgg(self.fig, master=view_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         toolbar = NavigationToolbar2Tk(self.canvas, view_frame, pack_toolbar=False)
@@ -578,7 +460,7 @@ class RobotViewApp:
         row += 1
 
         row = self._section(side, row, "5-Bar Linkage")
-        ttk.Checkbutton(side, text="Auto-solve passive calf joints", variable=self.vars["auto_passive"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(side, text="Auto-solve passive calf joints", variable=self.vars["auto_passive"], command=lambda: self.queue_draw(force_solve=True)).grid(row=row, column=0, sticky="w", pady=2)
         row += 1
         row = self._slider(side, row, "Left pad deg", "pad_left_deg", -20, 20, 0.1)
         row = self._slider(side, row, "Left motor A deg", "left_thigh_a_deg", -90, 90, 0.1)
@@ -600,19 +482,27 @@ class RobotViewApp:
         row = self._slider(side, row, "Roll deg", "roll", -18, 18, 0.1)
 
         row = self._section(side, row, "3D Display")
-        row = self._slider(side, row, "URDF scale", "urdf_scale", 1.0, 8.0, 0.1)
-        row = self._slider(side, row, "URDF triangles", "urdf_detail", 1000, 50000, 500)
-        ttk.Checkbutton(side, text="Show URDF joint pivots", variable=self.vars["show_joints"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
+        render_style = ttk.Combobox(
+            side,
+            textvariable=self.vars["render_style"],
+            values=("Linkage", "Solid"),
+            state="readonly",
+        )
+        render_style.grid(row=row, column=0, sticky="ew", pady=(0, 6))
+        render_style.bind("<<ComboboxSelected>>", lambda _event: self.queue_draw())
         row += 1
-        ttk.Checkbutton(side, text="Draw mesh edges", variable=self.vars["mesh_edges"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
+        row = self._slider(side, row, "URDF scale", "urdf_scale", 1.0, 8.0, 0.1)
+        ttk.Checkbutton(side, text="Show URDF joint pivots", variable=self.vars["show_joints"], command=self.queue_draw).grid(row=row, column=0, sticky="w", pady=2)
+        row += 1
+        ttk.Checkbutton(side, text="Draw mesh edges", variable=self.vars["mesh_edges"], command=self.queue_draw).grid(row=row, column=0, sticky="w", pady=2)
         row += 1
 
         row = self._section(side, row, "Camera")
         camera = ttk.Combobox(side, textvariable=self.vars["camera"], values=("ISO", "Front", "Side", "Top"), state="readonly")
         camera.grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        camera.bind("<<ComboboxSelected>>", lambda _event: self.draw_scene())
+        camera.bind("<<ComboboxSelected>>", lambda _event: self.draw_scene(reset_camera=True))
         row += 1
-        ttk.Button(side, text="Snapshot redraw", command=self.draw_scene).grid(row=row, column=0, sticky="ew", pady=4)
+        ttk.Button(side, text="Snapshot redraw", command=lambda: self.draw_scene(reset_camera=False)).grid(row=row, column=0, sticky="ew", pady=4)
         row += 1
 
         self.readout = tk.Text(side, height=8, width=36, relief="solid", bd=1, bg="#ffffff", fg="#1f2937")
@@ -641,22 +531,13 @@ class RobotViewApp:
         ttk.Label(frame, text=label).grid(row=0, column=0, sticky="w")
         value = ttk.Label(frame, textvariable=self.vars[key], width=7, anchor="e")
         value.grid(row=0, column=1, sticky="e")
-        scale = ttk.Scale(frame, from_=start, to=end, variable=self.vars[key], command=lambda _v: self.draw_scene())
+        scale = ttk.Scale(frame, from_=start, to=end, variable=self.vars[key], command=lambda _v: self.queue_draw(changed_key=key))
         scale.grid(row=1, column=0, columnspan=2, sticky="ew")
-        spin = ttk.Spinbox(frame, from_=start, to=end, increment=step, textvariable=self.vars[key], width=8, command=self.draw_scene)
+        spin = ttk.Spinbox(frame, from_=start, to=end, increment=step, textvariable=self.vars[key], width=8, command=lambda: self.queue_draw(changed_key=key))
         spin.grid(row=2, column=1, sticky="e", pady=(2, 0))
         return row + 1
 
-    def play(self) -> None:
-        self.running = True
-        self.last_tick = time.perf_counter()
-
-    def pause(self) -> None:
-        self.running = False
-        self.draw_scene()
-
     def reset(self) -> None:
-        self.running = False
         self.state = RobotState()
         for key in (
             "pad_left_deg",
@@ -675,31 +556,46 @@ class RobotViewApp:
             "roll",
         ):
             self.vars[key].set(0.0)
-        self.draw_scene()
-
-    def _tick(self) -> None:
-        now = time.perf_counter()
-        dt = min(0.05, now - self.last_tick)
-        self.last_tick = now
-        if self.running:
-            self.state.t += dt
-            fps = max(1.0, float(self.vars["fps"].get()))
-            if now - self.last_render >= 1.0 / fps:
-                self.last_render = now
-                self.draw_scene()
-        self.root.after(16, self._tick)
+        self.solve_dirty_sides = {"left", "right"}
+        self.draw_scene(reset_camera=True)
 
     def body_rotation(self) -> np.ndarray:
         pitch = math.radians(float(self.vars["pitch"].get()))
         roll = math.radians(float(self.vars["roll"].get()))
         return rot_z(self.state.yaw) @ rot_y(pitch) @ rot_x(roll)
 
-    def draw_scene(self) -> None:
+    def queue_draw(self, delay_ms: int = 1, changed_key: str | None = None, force_solve: bool = False) -> None:
+        self._mark_solver_dirty(changed_key, force_solve)
+        if self.redraw_after_id is not None:
+            self.root.after_cancel(self.redraw_after_id)
+        self.redraw_after_id = self.root.after(delay_ms, self._run_queued_draw)
+
+    def _mark_solver_dirty(self, changed_key: str | None, force_solve: bool = False) -> None:
+        if force_solve:
+            self.solve_dirty_sides = {"left", "right"}
+            return
+        if changed_key is None:
+            return
+        if changed_key.startswith("left_") or changed_key in {"pad_left_deg", "wheel_left_deg"}:
+            self.solve_dirty_sides.add("left")
+        elif changed_key.startswith("right_") or changed_key in {"pad_right_deg", "wheel_right_deg"}:
+            self.solve_dirty_sides.add("right")
+
+    def _run_queued_draw(self) -> None:
+        self.redraw_after_id = None
+        self.draw_scene(reset_camera=False)
+
+    def draw_scene(self, reset_camera: bool = False) -> None:
+        if self.redraw_after_id is not None:
+            self.root.after_cancel(self.redraw_after_id)
+            self.redraw_after_id = None
+        self._remember_camera()
         self.ax.clear()
         self.ax.set_facecolor("#eef1f5")
+        self.fig.set_facecolor("#eef1f5")
         self.fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
         self._draw_robot()
-        self._set_camera()
+        self._set_camera(reset_camera=reset_camera)
         self._update_text()
         self.canvas.draw_idle()
 
@@ -707,34 +603,7 @@ class RobotViewApp:
         if self.urdf is not None:
             self._draw_urdf_robot()
             return
-        if self.mesh is not None and bool(self.vars["use_stl"].get()):
-            self._draw_stl_robot()
-            return
-
-        self._draw_wheel_biped_placeholder()
-
-    def _draw_wheel_biped_placeholder(self) -> None:
-        R = self.body_rotation()
-        wheel_radius = 0.16
-        wheel_track = 0.62
-        body_h = max(float(self.vars["body_h"].get()), wheel_radius * 2.4)
-        origin = np.array([self.state.x, self.state.y, body_h])
-
-        body_color = "#5f697b"
-        link_color = "#7d8798"
-        wheel_color = "#242933"
-        axle_color = "#2f3645"
-
-        self._add_faces(box_faces(origin, (0.70, 0.46, 0.42), R), body_color, 0.98)
-        self._add_faces(box_faces(transform(np.array([[0, 0, 0.30]]), origin, R)[0], (0.76, 0.52, 0.10), R), "#aab3c5", 0.98)
-
-        for side, spin in ((-1.0, self.state.left_wheel), (1.0, self.state.right_wheel)):
-            wheel_center = transform(np.array([[0.0, side * wheel_track / 2.0, wheel_radius]]), np.array([self.state.x, self.state.y, 0.0]), R)[0]
-            shoulder = transform(np.array([[0.0, side * wheel_track * 0.36, -0.28]]), origin, R)[0]
-            self._add_faces(oriented_bar_faces(shoulder, wheel_center, 0.045, 0.055), link_color, 0.96)
-            self._draw_cylinder(wheel_center, wheel_radius, 0.055, "y", R, wheel_color)
-            self._draw_cylinder(wheel_center, wheel_radius * 0.42, 0.075, "y", R, axle_color)
-            self._draw_wheel_spokes(wheel_center, wheel_radius, spin, R)
+        self.ax.text(0.0, 0.0, 0.0, self.urdf_error or "URDF model is not loaded", color="#b91c1c")
 
     def _draw_urdf_robot(self) -> None:
         if self.urdf is None:
@@ -751,10 +620,10 @@ class RobotViewApp:
         root_origin[:2] += body_origin[:2] - bounds_center_xy
         root_origin[2] += ground_clearance - bounds_min[2]
         transforms = self._urdf_link_transforms(root_origin, root_R, scale)
-        total = max(1, self.urdf.triangle_count)
-        requested = int(float(self.vars["urdf_detail"].get()))
-        budget = max(1, min(requested, total))
-        ratio = budget / total
+
+        if str(self.vars["render_style"].get()) == "Linkage":
+            self._draw_linkage_diagram(transforms, scale)
+            return
 
         for link_name, (origin, rotation) in transforms.items():
             link = self.urdf.links.get(link_name)
@@ -763,27 +632,143 @@ class RobotViewApp:
             for visual in link.visuals:
                 visual_R = rotation @ rpy_matrix(visual.origin_rpy)
                 visual_origin = origin + (visual.origin_xyz * scale) @ rotation.T
-                triangles = visual.triangles * scale
-                detail = max(1, min(len(triangles), int(len(triangles) * ratio)))
-                indices = np.arange(len(triangles), dtype=np.int64) if detail >= len(triangles) else np.linspace(0, len(triangles) - 1, detail, dtype=np.int64)
-                faces = triangles[indices].reshape(-1, 3) @ visual_R.T + visual_origin
-                faces = faces.reshape(-1, 3, 3)
-                face_colors = self._urdf_face_colors(visual, indices, visual_R)
-                draw_edges = bool(self.vars["mesh_edges"].get())
-                mesh = Poly3DCollection(
-                    faces,
-                    facecolor=face_colors,
-                    edgecolor="#26303f" if draw_edges else "none",
-                    linewidth=0.12 if draw_edges else 0.0,
-                    alpha=visual.color[3],
-                )
-                mesh.set_zsort("average")
-                self.ax.add_collection3d(mesh)
+                self._draw_link_proxy(link_name, visual, visual_origin, visual_R, scale)
 
         if bool(self.vars["show_joints"].get()):
             points = np.asarray([value[0] for name, value in transforms.items() if name != self.urdf.root_link])
             if len(points):
-                self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=10, color="#2563eb", depthshade=False)
+                self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=18, color="#1d4ed8", edgecolors="#ffffff", linewidths=0.45, depthshade=False)
+
+    def _draw_linkage_diagram(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> None:
+        self.ax.set_facecolor("#ffffff")
+        self.fig.set_facecolor("#ffffff")
+        self._draw_linkage_reference_grid(transforms)
+
+        for side_name, side_color, target_color in (
+            ("right", "#222222", "#0066ff"),
+            ("left", "#5b6472", "#0ea5e9"),
+        ):
+            self._draw_fivebar_side(transforms, side_name, side_color, target_color, scale)
+
+        if bool(self.vars["show_joints"].get()):
+            all_points = np.asarray([value[0] for name, value in transforms.items() if name != self.urdf.root_link])
+            if len(all_points):
+                self.ax.scatter(all_points[:, 0], all_points[:, 1], all_points[:, 2], s=8, color="#9ca3af", depthshade=False, alpha=0.55)
+
+    def _draw_fivebar_side(
+        self,
+        transforms: dict[str, tuple[np.ndarray, np.ndarray]],
+        side: str,
+        link_color: str,
+        point_color: str,
+        scale: float,
+    ) -> None:
+        required = {
+            "A1": f"thigh_{side}_1",
+            "A2": f"thigh_{side}_2",
+            "B1": f"calf_{side}_link_1",
+            "B2": f"calf_{side}_link_2",
+            "P": f"wheel_link_{side}",
+            "pad": f"pad_link_{side}",
+            "hip": f"hip_frame_link_{side}",
+        }
+        if any(link not in transforms for link in required.values()):
+            return
+
+        A1 = transforms[required["A1"]][0]
+        A2 = transforms[required["A2"]][0]
+        B1 = transforms[required["B1"]][0]
+        B2 = transforms[required["B2"]][0]
+        P = transforms[required["P"]][0]
+        pad = transforms[required["pad"]][0]
+        hip = transforms[required["hip"]][0]
+
+        self._plot_link(A1, A2, "#d1d5db", linewidth=1.5)
+        self._plot_link(pad, hip, "#d1d5db", linewidth=2.0)
+        self._plot_link(A1, B1, link_color, linewidth=3.0)
+        self._plot_link(A2, B2, link_color, linewidth=3.0)
+        self._plot_link(B1, P, link_color, linewidth=3.0)
+        self._plot_link(B2, P, link_color, linewidth=3.0)
+
+        wheel_radius = self._link_radius(required["P"], scale, fallback=0.045 * scale)
+        self._draw_cylinder(P, wheel_radius, 0.018 * scale, "y", transforms[required["P"]][1], "#2d3340", edge_color="#151922", segments=32)
+
+        self._plot_point(A1, "A1", fill="#000000")
+        self._plot_point(A2, "A2", fill="#000000")
+        self._plot_point(B1, "B1", fill="#333333")
+        self._plot_point(B2, "B2", fill="#333333")
+        self._plot_point(P, "P", fill=point_color, size=42)
+
+        label_anchor = (A1 + A2) * 0.5
+        self.ax.text(label_anchor[0], label_anchor[1], label_anchor[2] + 0.05 * scale, side.upper(), color=link_color, fontsize=9, ha="center")
+
+    def _plot_link(self, p0: Vec3, p1: Vec3, color: str, linewidth: float = 2.0) -> None:
+        self.ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]], color=color, linewidth=linewidth, solid_capstyle="round")
+
+    def _plot_point(self, p: Vec3, label: str, fill: str = "#000000", size: float = 30.0) -> None:
+        self.ax.scatter([p[0]], [p[1]], [p[2]], s=size, color=fill, edgecolors="#ffffff", linewidths=0.7, depthshade=False)
+        self.ax.text(p[0], p[1], p[2] + 0.025, label, color="#333333", fontsize=8)
+
+    def _link_radius(self, link_name: str, scale: float, fallback: float) -> float:
+        if self.urdf is None:
+            return fallback
+        link = self.urdf.links.get(link_name)
+        if link is None or not link.visuals:
+            return fallback
+        visual = link.visuals[0]
+        extents = np.maximum((visual.bounds_max - visual.bounds_min) * scale, 1e-5)
+        return max(float(extents[0]), float(extents[2])) * 0.5
+
+    def _draw_linkage_reference_grid(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
+        points = np.asarray([origin for origin, _rotation in transforms.values()])
+        if len(points) == 0:
+            return
+        mins = points.min(axis=0)
+        maxs = points.max(axis=0)
+        z = mins[2] - 0.015
+        step = max(0.05, float(np.linalg.norm(maxs[:2] - mins[:2])) / 8.0)
+        x0, x1 = mins[0] - step, maxs[0] + step
+        y0, y1 = mins[1] - step, maxs[1] + step
+        xs = np.arange(x0, x1 + step, step)
+        ys = np.arange(y0, y1 + step, step)
+        for x in xs:
+            self.ax.plot([x, x], [y0, y1], [z, z], color="#f0f0f0", linewidth=0.7)
+        for y in ys:
+            self.ax.plot([x0, x1], [y, y], [z, z], color="#f0f0f0", linewidth=0.7)
+
+    def _draw_link_proxy(self, link_name: str, visual: MeshVisual, origin: Vec3, rotation: np.ndarray, scale: float) -> None:
+        base_color, edge_color = self._solidworks_link_style(link_name)
+        bounds_min = visual.bounds_min
+        bounds_max = visual.bounds_max
+        extents = np.maximum((bounds_max - bounds_min) * scale, 1e-4)
+        center_local = (bounds_min + bounds_max) * 0.5
+        center = origin + (center_local * scale) @ rotation.T
+
+        if "wheel" in link_name:
+            axis = "y" if extents[1] <= max(extents[0], extents[2]) else "x"
+            radius = max(float(extents[0]), float(extents[2])) * 0.5
+            length = max(float(extents[1]), 0.025 * scale)
+            self._draw_cylinder(center, radius, length, axis, rotation, base_color, edge_color=edge_color, segments=40)
+            self._draw_cylinder(center, radius * 0.42, length * 1.12, axis, rotation, "#d7dee9", edge_color=edge_color, segments=32)
+            return
+
+        faces = box_faces_from_bounds(bounds_min, bounds_max, origin, rotation, scale)
+        self._add_faces(faces, base_color, alpha=min(0.98, visual.color[3]), edge=edge_color)
+
+    def _solidworks_link_style(self, link_name: str) -> tuple[str, str]:
+        if link_name == "base_link":
+            return "#d8dde7", "#7b8494"
+        if "pad" in link_name:
+            return "#b7c0d0", "#6f7887"
+        if "hip" in link_name:
+            return "#cfd7e6", "#7b8494"
+        if "thigh" in link_name:
+            return "#8fb6dc", "#386b96"
+        if "calf" in link_name:
+            return "#9aa7b8", "#596678"
+        if "wheel" in link_name:
+            return "#2d3340", "#151922"
+        return "#c4ccd8", "#6f7887"
 
     def _urdf_link_transforms(
         self,
@@ -826,13 +811,30 @@ class RobotViewApp:
             for visual in link.visuals:
                 visual_R = rotation @ rpy_matrix(visual.origin_rpy)
                 visual_origin = origin + (visual.origin_xyz * scale) @ rotation.T
-                points = visual.triangles.reshape(-1, 3) * scale
-                world_points = points @ visual_R.T + visual_origin
+                world_points = self._visual_bounds_points(visual, visual_origin, visual_R, scale)
                 bounds_min = np.minimum(bounds_min, world_points.min(axis=0))
                 bounds_max = np.maximum(bounds_max, world_points.max(axis=0))
         if not np.isfinite(bounds_min).all():
             return np.zeros(3), np.ones(3)
         return bounds_min, bounds_max
+
+    def _visual_bounds_points(self, visual: MeshVisual, origin: Vec3, rotation: np.ndarray, scale: float) -> np.ndarray:
+        lo = visual.bounds_min
+        hi = visual.bounds_max
+        points = np.array(
+            [
+                [lo[0], lo[1], lo[2]],
+                [hi[0], lo[1], lo[2]],
+                [hi[0], hi[1], lo[2]],
+                [lo[0], hi[1], lo[2]],
+                [lo[0], lo[1], hi[2]],
+                [hi[0], lo[1], hi[2]],
+                [hi[0], hi[1], hi[2]],
+                [lo[0], hi[1], hi[2]],
+            ],
+            dtype=float,
+        )
+        return points * scale @ rotation.T + origin
 
     def _urdf_joint_angles(self) -> dict[str, float]:
         angles = {
@@ -849,33 +851,41 @@ class RobotViewApp:
             "calf_joint_left_2": math.radians(float(self.vars["left_calf_b_deg"].get())),
             "wheel_joint_left": math.radians(float(self.vars["wheel_left_deg"].get())),
         }
-        self.last_closure_error = {"left": 0.0, "right": 0.0}
         if bool(self.vars["auto_passive"].get()):
-            right_calf_a, right_calf_b, right_error = self._solve_parallel_side(
-                angles,
-                calf_a="calf_joint_right_1",
-                calf_b="calf_joint_right_2",
-                wheel_link="wheel_link_right",
-                branch_b_link="calf_right_link_2",
-                loop_origin=np.array([-0.18, -0.03, 0.0]),
-            )
-            left_calf_a, left_calf_b, left_error = self._solve_parallel_side(
-                angles,
-                calf_a="calf_joint_left_1",
-                calf_b="calf_joint_left_2",
-                wheel_link="wheel_link_left",
-                branch_b_link="calf_left_link_2",
-                loop_origin=np.array([-0.18, 0.03, 0.0]),
-            )
-            angles["calf_joint_right_1"] = right_calf_a
-            angles["calf_joint_right_2"] = right_calf_b
-            angles["calf_joint_left_1"] = left_calf_a
-            angles["calf_joint_left_2"] = left_calf_b
-            self.vars["right_calf_a_deg"].set(round(math.degrees(right_calf_a), 3))
-            self.vars["right_calf_b_deg"].set(round(math.degrees(right_calf_b), 3))
-            self.vars["left_calf_a_deg"].set(round(math.degrees(left_calf_a), 3))
-            self.vars["left_calf_b_deg"].set(round(math.degrees(left_calf_b), 3))
-            self.last_closure_error = {"left": left_error, "right": right_error}
+            dirty = set(self.solve_dirty_sides)
+            if "right" in dirty:
+                right_calf_a, right_calf_b, right_error = self._solve_parallel_side(
+                    angles,
+                    calf_a="calf_joint_right_1",
+                    calf_b="calf_joint_right_2",
+                    wheel_link="wheel_link_right",
+                    branch_b_link="calf_right_link_2",
+                    loop_origin=np.array([-0.18, -0.03, 0.0]),
+                )
+                angles["calf_joint_right_1"] = right_calf_a
+                angles["calf_joint_right_2"] = right_calf_b
+                self.vars["right_calf_a_deg"].set(round(math.degrees(right_calf_a), 3))
+                self.vars["right_calf_b_deg"].set(round(math.degrees(right_calf_b), 3))
+                self.last_closure_error["right"] = right_error
+
+            if "left" in dirty:
+                left_calf_a, left_calf_b, left_error = self._solve_parallel_side(
+                    angles,
+                    calf_a="calf_joint_left_1",
+                    calf_b="calf_joint_left_2",
+                    wheel_link="wheel_link_left",
+                    branch_b_link="calf_left_link_2",
+                    loop_origin=np.array([-0.18, 0.03, 0.0]),
+                )
+                angles["calf_joint_left_1"] = left_calf_a
+                angles["calf_joint_left_2"] = left_calf_b
+                self.vars["left_calf_a_deg"].set(round(math.degrees(left_calf_a), 3))
+                self.vars["left_calf_b_deg"].set(round(math.degrees(left_calf_b), 3))
+                self.last_closure_error["left"] = left_error
+
+            self.solve_dirty_sides.difference_update(dirty)
+        else:
+            self.last_closure_error = {"left": 0.0, "right": 0.0}
         return angles
 
     def _solve_parallel_side(
@@ -930,110 +940,35 @@ class RobotViewApp:
         self.solver_chains[target_link] = chain
         return chain
 
-    def _parallel_closure_error(
+    def _draw_cylinder(
         self,
-        joint_angles: dict[str, float],
-        wheel_link: str,
-        branch_b_link: str,
-        loop_origin: np.ndarray,
-    ) -> float:
-        transforms = self._urdf_link_transforms(np.zeros(3), np.eye(3), 1.0, joint_angles)
-        if wheel_link not in transforms or branch_b_link not in transforms:
-            return math.inf
-        wheel_center = transforms[wheel_link][0]
-        branch_origin, branch_rotation = transforms[branch_b_link]
-        branch_tip = branch_origin + loop_origin @ branch_rotation.T
-        return float(np.linalg.norm(wheel_center - branch_tip))
-
-    def _urdf_face_colors(self, visual: MeshVisual, indices: np.ndarray, rotation: np.ndarray) -> np.ndarray:
-        base = np.array(visual.color[:3])
-        highlight = np.clip(base + 0.18, 0.0, 1.0)
-        shadow = np.clip(base * 0.52, 0.0, 1.0)
-        normals = visual.normals[indices]
-        light = normalize(np.array([-0.35, -0.55, 0.76]))
-        rotated_light = rotation @ light
-        intensity = np.clip(normals @ rotated_light, -0.35, 1.0)
-        pos = np.clip(intensity, 0.0, 1.0)[:, None]
-        neg = np.clip(-intensity, 0.0, 0.35)[:, None]
-        colors = base * (1 - pos * 0.42 - neg * 0.55) + highlight * (pos * 0.42) + shadow * (neg * 0.55)
-        alpha = np.full((len(indices), 1), visual.color[3])
-        return np.hstack((np.clip(colors, 0.0, 1.0), alpha))
-
-    def _draw_stl_robot(self) -> None:
-        if self.mesh is None:
-            return
-        R = self.body_rotation()
-        body_h = float(self.vars["body_h"].get())
-        origin = np.array([self.state.x, self.state.y, body_h])
-        detail = self._effective_mesh_detail()
-        detail = max(1, min(detail, len(self.mesh.triangles)))
-        indices = self._mesh_lod_indices(detail)
-        local = self.mesh.triangles[indices]
-        world_faces = local.reshape(-1, 3) @ R.T + origin
-        world_faces = world_faces.reshape(-1, 3, 3)
-        draw_edges = bool(self.vars["mesh_edges"].get()) and not self.running
-        face_colors = "#687184" if self.running else self._mesh_face_colors(indices, R)
-        mesh = Poly3DCollection(
-            world_faces,
-            facecolor=face_colors,
-            edgecolor="#242b38" if draw_edges else "none",
-            linewidth=0.10 if draw_edges else 0.0,
-            alpha=0.98,
-        )
-        mesh.set_zsort("average")
-        self.ax.add_collection3d(mesh)
-
-        self.ax.scatter([origin[0]], [origin[1]], [origin[2]], s=12, color="#2f80ed", depthshade=False)
-
-    def _effective_mesh_detail(self) -> int:
-        if self.mesh is None:
-            return 0
-        requested = int(float(self.vars["mesh_detail"].get()))
-        if self.running:
-            requested = min(requested, int(float(self.vars["live_detail"].get())))
-        return max(1, min(requested, len(self.mesh.triangles)))
-
-    def _mesh_lod_indices(self, detail: int) -> np.ndarray:
-        if self.mesh is None:
-            return np.empty((0,), dtype=np.int64)
-        total = len(self.mesh.triangles)
-        if detail >= total:
-            return np.arange(total, dtype=np.int64)
-        return np.linspace(0, total - 1, detail, dtype=np.int64)
-
-    def _mesh_face_colors(self, indices: np.ndarray, rotation: np.ndarray) -> np.ndarray:
-        if self.mesh is None:
-            return np.empty((0, 4))
-        base = np.array(to_rgb("#6f788c"))
-        highlight = np.array(to_rgb("#a8b1c2"))
-        shadow = np.array(to_rgb("#434b5a"))
-        normals = self.mesh.normals[indices]
-        light = normalize(np.array([-0.35, -0.55, 0.76]))
-        rotated_light = rotation @ light
-        intensity = np.clip(normals @ rotated_light, -0.35, 1.0)
-        pos = np.clip(intensity, 0.0, 1.0)[:, None]
-        neg = np.clip(-intensity, 0.0, 0.35)[:, None]
-        colors = base * (1 - pos * 0.45 - neg * 0.55) + highlight * (pos * 0.45) + shadow * (neg * 0.55)
-        colors = np.clip(colors, 0.0, 1.0)
-        alpha = np.full((len(indices), 1), 0.98)
-        colors = np.hstack((colors, alpha))
-        return colors
-
-    def _draw_wheel_spokes(self, center: Vec3, radius: float, spin: float, R: np.ndarray) -> None:
-        for angle in np.linspace(0, 2 * math.pi, 8, endpoint=False):
-            local = np.array([[0, 0, 0], [radius * 0.72 * math.cos(angle + spin), 0, radius * 0.72 * math.sin(angle + spin)]])
-            spoke = transform(local, center, R)
-            self.ax.plot([spoke[0, 0], spoke[1, 0]], [spoke[0, 1], spoke[1, 1]], [spoke[0, 2], spoke[1, 2]], color="#aeb7c7", linewidth=1.0)
-
-    def _draw_cylinder(self, center: Vec3, radius: float, length: float, axis: str, R: np.ndarray, color: str) -> None:
-        x, y, z = cylinder_mesh(center, radius, length, axis=axis, rotation=R)
-        self.ax.plot_surface(x, y, z, color=color, edgecolor="#1d2430", linewidth=0.25, shade=True, alpha=0.98)
+        center: Vec3,
+        radius: float,
+        length: float,
+        axis: str,
+        R: np.ndarray,
+        color: str,
+        edge_color: str = "#1d2430",
+        segments: int = 28,
+    ) -> None:
+        x, y, z = cylinder_mesh(center, radius, length, axis=axis, rotation=R, segments=segments)
+        self.ax.plot_surface(x, y, z, color=color, edgecolor=edge_color, linewidth=0.25, shade=True, alpha=0.98)
 
     def _add_faces(self, faces: list[np.ndarray], color: str, alpha: float = 1.0, edge: str = "#1f2633") -> None:
         collection = Poly3DCollection(faces, facecolor=color, edgecolor=edge, linewidth=0.6, alpha=alpha)
         self.ax.add_collection3d(collection)
 
-    def _set_camera(self) -> None:
+    def _remember_camera(self) -> None:
+        if not hasattr(self, "ax"):
+            return
+        elev = getattr(self.ax, "elev", None)
+        azim = getattr(self.ax, "azim", None)
+        roll = getattr(self.ax, "roll", 0.0)
+        if elev is None or azim is None:
+            return
+        self.camera_view = (float(elev), float(azim), float(roll))
+
+    def _set_camera(self, reset_camera: bool = False) -> None:
         view_span = float(self.vars["view_span"].get())
         center_x, center_y = self.state.x, self.state.y
         span = max(view_span, 2.4)
@@ -1043,9 +978,6 @@ class RobotViewApp:
             urdf_scale = float(self.vars["urdf_scale"].get())
             top = max(1.2, float(self.urdf.bounds_max[2] - self.urdf.bounds_min[2]) * urdf_scale) + 0.55
             self.ax.set_zlim(0, max(2.4, top))
-        elif self.mesh is not None and bool(self.vars["use_stl"].get()):
-            top = float(self.vars["body_h"].get()) + float(self.mesh.local_max[2]) + 0.35
-            self.ax.set_zlim(0, max(3.0, top))
         else:
             self.ax.set_zlim(0, 3.6)
         self.ax.set_box_aspect((1, 1, 0.45))
@@ -1054,23 +986,29 @@ class RobotViewApp:
         self.ax.set_zlabel("Z")
         self.ax.set_axis_off()
 
-        camera = str(self.vars["camera"].get())
-        if camera == "Front":
-            self.ax.view_init(elev=8, azim=-90)
-        elif camera == "Side":
-            self.ax.view_init(elev=12, azim=0)
-        elif camera == "Top":
-            self.ax.view_init(elev=89, azim=-90)
-        else:
-            self.ax.view_init(elev=24, azim=-45)
+        if reset_camera or not self.camera_initialized or self.camera_view is None:
+            camera = str(self.vars["camera"].get())
+            if camera == "Front":
+                self.camera_view = (8.0, -90.0, 0.0)
+            elif camera == "Side":
+                self.camera_view = (12.0, 0.0, 0.0)
+            elif camera == "Top":
+                self.camera_view = (89.0, -90.0, 0.0)
+            else:
+                self.camera_view = (24.0, -45.0, 0.0)
+            self.camera_initialized = True
+
+        elev, azim, roll = self.camera_view
+        try:
+            self.ax.view_init(elev=elev, azim=azim, roll=roll)
+        except TypeError:
+            self.ax.view_init(elev=elev, azim=azim)
 
     def _update_text(self) -> None:
         now = time.perf_counter()
-        if self.running and now - self.last_text_update < 0.25:
-            return
         self.last_text_update = now
         status = (
-            f"{'UPDATING' if self.running else 'STATIC'} | "
+            "STATIC | "
             f"solver={solver_status().backend} | "
             f"left closure={self.last_closure_error['left']:.5f} m | "
             f"right closure={self.last_closure_error['right']:.5f} m"
@@ -1078,6 +1016,7 @@ class RobotViewApp:
         self.status.configure(text=status)
         lines = [
             "Linkage telemetry",
+            f"Render style: {self.vars['render_style'].get()}",
             f"Time: {self.state.t:6.2f} s",
             f"Pitch/Roll: {float(self.vars['pitch'].get()):+.1f} / {float(self.vars['roll'].get()):+.1f} deg",
             f"Auto passive: {bool(self.vars['auto_passive'].get())}",
@@ -1094,24 +1033,13 @@ class RobotViewApp:
                     f"URDF: {self.urdf.name}",
                     f"Root link: {self.urdf.root_link}",
                     f"Links/Joints: {len(self.urdf.links)} / {len(self.urdf.joints)}",
-                    f"Meshes: {self.urdf.mesh_count}",
-                    f"Source triangles: {self.urdf.triangle_count:,}",
+                    f"Bounded meshes: {self.urdf.mesh_count}",
+                    f"Source facets read once: {self.urdf.triangle_count:,}",
+                    "Rendered as lightweight solids",
                 ]
             )
         elif self.urdf_error:
             lines.extend(["", self.urdf_error])
-        elif self.mesh is not None:
-            lines.extend(
-                [
-                    "",
-                    f"STL: {self.mesh.name}",
-                    f"Source triangles: {self.mesh.triangle_count:,}",
-                    f"Rendered triangles: {self._effective_mesh_detail():,}",
-                    f"Auto scale: {self.mesh.scale:.6g}",
-                ]
-            )
-        elif mode == "STL" and self.mesh_error:
-            lines.extend(["", self.mesh_error])
         self.readout.configure(state="normal")
         self.readout.delete("1.0", "end")
         self.readout.insert("1.0", "\n".join(lines))
