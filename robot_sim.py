@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from fivebar_solver import compute_link_transforms, make_step, make_tree_step, solve_passive_pair, solver_status
+from fivebar_solver import compute_link_transforms, compute_supported_link_transforms, make_step, make_tree_step, solve_passive_pair, solver_status
 
 matplotlib.use("TkAgg")
 
@@ -43,8 +43,6 @@ class RobotState:
     x: float = 0.0
     y: float = 0.0
     yaw: float = 0.0
-    pitch: float = 0.0
-    roll: float = 0.0
     left_wheel: float = 0.0
     right_wheel: float = 0.0
 
@@ -104,6 +102,48 @@ def transform(points: np.ndarray, origin: Vec3, rotation: np.ndarray) -> np.ndar
 def rpy_matrix(rpy: Vec3) -> np.ndarray:
     roll, pitch, yaw = [float(v) for v in rpy]
     return rot_z(yaw) @ rot_y(pitch) @ rot_x(roll)
+
+def rotation_between_vectors(source: Vec3, target: Vec3) -> np.ndarray:
+    source = np.asarray(source, dtype=float)
+    target = np.asarray(target, dtype=float)
+    source_norm = float(np.linalg.norm(source))
+    target_norm = float(np.linalg.norm(target))
+    if source_norm < 1e-12 or target_norm < 1e-12:
+        return np.eye(3)
+    a = source / source_norm
+    b = target / target_norm
+    axis = np.cross(a, b)
+    axis_norm = float(np.linalg.norm(axis))
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    if axis_norm < 1e-12:
+        if dot > 0.0:
+            return np.eye(3)
+        helper = np.array([1.0, 0.0, 0.0])
+        if abs(float(np.dot(a, helper))) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(a, helper)
+        axis_norm = float(np.linalg.norm(axis))
+    axis = axis / axis_norm
+    return axis_angle_matrix(axis, math.atan2(axis_norm, dot))
+
+def axis_angle_matrix(axis: Vec3, angle: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=float)
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-12:
+        axis = np.array([0.0, 0.0, 1.0])
+    else:
+        axis = axis / norm
+    x, y, z = axis
+    c, s = math.cos(angle), math.sin(angle)
+    C = 1.0 - c
+    return np.array(
+        [
+            [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+        ],
+        dtype=float,
+    )
 
 def parse_vec(text: str | None, fallback: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> np.ndarray:
     if not text:
@@ -316,7 +356,11 @@ class RobotViewApp:
         self.link_index: dict[str, int] = {}
         self.tree_steps = np.empty((0, 13), dtype=np.float64)
         self.last_closure_error: dict[str, float] = {"left": 0.0, "right": 0.0}
-
+        self.backend_warning = ""
+        self.balance_tilt_deg = 0.0
+        self.balance_roll_deg = 0.0
+        self.balance_pitch_deg = 0.0
+        
         self.vars: dict[str, tk.Variable] = {}
         self._build_vars()
         self._load_urdf_model()
@@ -345,8 +389,7 @@ class RobotViewApp:
             "wheel_right_deg": 0.0,
             "mesh_edges": True,
             "camera": "ISO",
-            "pitch": 0.0,
-            "roll": 0.0,
+
         }
         for key, value in defaults.items():
             if isinstance(value, bool):
@@ -506,10 +549,6 @@ class RobotViewApp:
         row = self._slider(side, row, "Right calf B deg", "right_calf_b_deg", -90, 90, 0.1)
         row = self._slider(side, row, "Right wheel deg", "wheel_right_deg", -180, 180, 1)
 
-        row = self._section(side, row, "Body Pose")
-        row = self._slider(side, row, "Pitch deg", "pitch", -18, 18, 0.1)
-        row = self._slider(side, row, "Roll deg", "roll", -18, 18, 0.1)
-
         row = self._section(side, row, "3D Display")
         render_style = ttk.Combobox(
             side,
@@ -581,17 +620,13 @@ class RobotViewApp:
             "right_calf_b_deg",
             "wheel_left_deg",
             "wheel_right_deg",
-            "pitch",
-            "roll",
         ):
             self.vars[key].set(0.0)
         self.solve_dirty_sides = {"left", "right"}
         self.draw_scene(reset_camera=True)
 
     def body_rotation(self) -> np.ndarray:
-        pitch = math.radians(float(self.vars["pitch"].get()))
-        roll = math.radians(float(self.vars["roll"].get()))
-        return rot_z(self.state.yaw) @ rot_y(pitch) @ rot_x(roll)
+        return rot_z(self.state.yaw)
 
     def queue_draw(self, delay_ms: int = 1, changed_key: str | None = None, force_solve: bool = False) -> None:
         self._mark_solver_dirty(changed_key, force_solve)
@@ -633,6 +668,7 @@ class RobotViewApp:
             try:
                 self._draw_urdf_robot()
             except RuntimeError as exc:
+                self.backend_warning = str(exc)
                 self.ax.text(0.0, 0.0, 0.0, str(exc), color="#b91c1c")
             return
         self.ax.text(0.0, 0.0, 0.0, self.urdf_error or "URDF model is not loaded", color="#b91c1c")
@@ -644,14 +680,10 @@ class RobotViewApp:
         scale = float(self.vars["urdf_scale"].get())
         body_origin = np.array([self.state.x, self.state.y, 0.0])
         root_R = body_R @ rot_z(math.radians(90.0))
-        root_origin = body_origin.copy()
-        transforms = self._urdf_link_transforms(root_origin, root_R, scale)
-        bounds_min, bounds_max = self._urdf_world_bounds(transforms, scale)
-        ground_clearance = 0.015
-        bounds_center_xy = (bounds_min[:2] + bounds_max[:2]) / 2.0
-        root_origin[:2] += body_origin[:2] - bounds_center_xy
-        root_origin[2] += ground_clearance - bounds_min[2]
-        transforms = self._urdf_link_transforms(root_origin, root_R, scale)
+        joint_angles = self._urdf_joint_angles()
+        root_R = self._support_aligned_root_rotation(root_R, scale, joint_angles)
+        root_origin = self._support_anchored_root(body_origin, root_R, scale, joint_angles)
+        transforms = self._urdf_link_transforms(root_origin, root_R, scale, joint_angles)
 
         if str(self.vars["render_style"].get()) == "Linkage":
             self._draw_linkage_diagram(transforms, scale)
@@ -671,10 +703,96 @@ class RobotViewApp:
             if len(points):
                 self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=18, color="#1d4ed8", edgecolors="#ffffff", linewidths=0.45, depthshade=False)
 
+    def _support_aligned_root_rotation(
+        self,
+        root_rotation: np.ndarray,
+        scale: float,
+        joint_angles: dict[str, float],
+    ) -> np.ndarray:
+        transforms = self._urdf_link_transforms(np.zeros(3), root_rotation, scale, joint_angles)
+        if "wheel_link_left" not in transforms or "wheel_link_right" not in transforms:
+            return root_rotation
+        wheel_line = transforms["wheel_link_left"][0] - transforms["wheel_link_right"][0]
+        horizontal_line = wheel_line.copy()
+        horizontal_line[2] = 0.0
+        if np.linalg.norm(horizontal_line) < 1e-9:
+            return root_rotation
+        correction = rotation_between_vectors(wheel_line, horizontal_line)
+        return correction @ root_rotation
+
+    def _urdf_supported_link_transforms(
+        self,
+        support_origin: Vec3,
+        requested_root_rotation: np.ndarray,
+        scale: float,
+        joint_angles: dict[str, float],
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        if self.urdf is None or not self.link_order:
+            return {}
+        if "wheel_link_left" not in self.link_index or "wheel_link_right" not in self.link_index:
+            root_R = self._support_aligned_root_rotation(requested_root_rotation, scale, joint_angles)
+            root_origin = self._support_anchored_root(support_origin, root_R, scale, joint_angles)
+            return self._urdf_link_transforms(root_origin, root_R, scale, joint_angles)
+
+        angles = np.asarray([joint_angles[name] for name in JOINT_ANGLE_NAMES], dtype=np.float64)
+        wheel_radius = max(
+            self._link_radius("wheel_link_left", scale, fallback=0.045 * scale),
+            self._link_radius("wheel_link_right", scale, fallback=0.045 * scale),
+        )
+        try:
+            origins, rotations = compute_supported_link_transforms(
+                self.tree_steps,
+                angles,
+                support_origin,
+                requested_root_rotation,
+                scale,
+                len(self.link_order),
+                self.link_index["wheel_link_left"],
+                self.link_index["wheel_link_right"],
+                wheel_radius,
+            )
+            self.backend_warning = ""
+        except RuntimeError as exc:
+            self.backend_warning = f"{exc} | display fallback active"
+            root_R = self._support_aligned_root_rotation(requested_root_rotation, scale, joint_angles)
+            root_origin = self._support_anchored_root(support_origin, root_R, scale, joint_angles)
+            return self._urdf_link_transforms_python(root_origin, root_R, scale, joint_angles)
+
+        return {
+            name: (origins[index], rotations[index])
+            for index, name in enumerate(self.link_order)
+        }
+
+    def _support_anchored_root(
+        self,
+        support_origin: Vec3,
+        root_rotation: np.ndarray,
+        scale: float,
+        joint_angles: dict[str, float],
+    ) -> np.ndarray:
+        raw_root = np.zeros(3, dtype=float)
+        transforms = self._urdf_link_transforms(raw_root, root_rotation, scale, joint_angles)
+        wheel_names = [name for name in ("wheel_link_left", "wheel_link_right") if name in transforms]
+        if not wheel_names:
+            bounds_min, bounds_max = self._urdf_world_bounds(transforms, scale)
+            root = raw_root.copy()
+            root[:2] += support_origin[:2] - ((bounds_min[:2] + bounds_max[:2]) * 0.5)
+            root[2] += 0.015 - bounds_min[2]
+            return root
+
+        wheel_centers = np.asarray([transforms[name][0] for name in wheel_names])
+        wheel_radius = max(self._link_radius(name, scale, fallback=0.045 * scale) for name in wheel_names)
+        support_center = wheel_centers.mean(axis=0)
+        root = raw_root.copy()
+        root[:2] += support_origin[:2] - support_center[:2]
+        root[2] += wheel_radius - support_center[2]
+        return root
+
     def _draw_linkage_diagram(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> None:
         self.ax.set_facecolor("#ffffff")
         self.fig.set_facecolor("#ffffff")
         self._draw_linkage_reference_grid(transforms)
+        self._draw_balance_plane(transforms, scale)
 
         for side_name, side_color, target_color in (
             ("right", "#222222", "#0066ff"),
@@ -686,6 +804,70 @@ class RobotViewApp:
             all_points = np.asarray([value[0] for name, value in transforms.items() if name != self.urdf.root_link])
             if len(all_points):
                 self.ax.scatter(all_points[:, 0], all_points[:, 1], all_points[:, 2], s=8, color="#9ca3af", depthshade=False, alpha=0.55)
+
+    def _draw_balance_plane(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> None:
+        anchors = [
+            transforms[name][0]
+            for name in ("thigh_right_1", "thigh_right_2", "thigh_left_1", "thigh_left_2")
+            if name in transforms
+        ]
+        if len(anchors) < 3:
+            return
+        anchors = [np.asarray(point, dtype=float) for point in anchors]
+        right_center = (transforms["thigh_right_1"][0] + transforms["thigh_right_2"][0]) * 0.5
+        left_center = (transforms["thigh_left_1"][0] + transforms["thigh_left_2"][0]) * 0.5
+        x_axis = (
+            (transforms["thigh_right_2"][0] - transforms["thigh_right_1"][0])
+            + (transforms["thigh_left_2"][0] - transforms["thigh_left_1"][0])
+        ) * 0.5
+        y_axis = left_center - right_center
+        x_norm = float(np.linalg.norm(x_axis))
+        y_norm = float(np.linalg.norm(y_axis))
+        if x_norm < 1e-9 or y_norm < 1e-9:
+            return
+        x_axis = x_axis / x_norm
+        y_axis = y_axis / y_norm
+        normal = np.cross(x_axis, y_axis)
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm < 1e-9:
+            return
+        normal = normal / normal_norm
+        if normal[2] < 0.0:
+            normal = -normal
+            y_axis = -y_axis
+        y_axis = np.cross(normal, x_axis)
+
+        center = np.mean(np.asarray(anchors), axis=0) + normal * (0.018 * scale)
+        half_x = max(x_norm * 0.95, 0.14 * scale)
+        half_y = max(y_norm * 0.72, 0.10 * scale)
+        corners = np.array(
+            [
+                center - x_axis * half_x - y_axis * half_y,
+                center + x_axis * half_x - y_axis * half_y,
+                center + x_axis * half_x + y_axis * half_y,
+                center - x_axis * half_x + y_axis * half_y,
+            ]
+        )
+        plane = Poly3DCollection([corners], facecolor="#60a5fa", edgecolor="#1d4ed8", linewidth=0.75, alpha=0.24)
+        plane.set_zsort("average")
+        self.ax.add_collection3d(plane)
+        for anchor in anchors:
+            projected = center + x_axis * np.dot(anchor - center, x_axis) + y_axis * np.dot(anchor - center, y_axis)
+            self._plot_link(anchor, projected, "#93c5fd", linewidth=1.2)
+
+        up = np.array([0.0, 0.0, 1.0])
+        self.balance_tilt_deg = math.degrees(math.acos(float(np.clip(np.dot(normal, up), -1.0, 1.0))))
+        self.balance_roll_deg = math.degrees(math.atan2(normal[1], normal[2]))
+        self.balance_pitch_deg = math.degrees(math.atan2(-normal[0], math.sqrt(normal[1] * normal[1] + normal[2] * normal[2])))
+        self.ax.text(
+            center[0],
+            center[1],
+            center[2] + 0.018 * scale,
+            f"BALANCE PLANE\npitch={self.balance_pitch_deg:+.1f} roll={self.balance_roll_deg:+.1f}",
+            color="#1d4ed8",
+            fontsize=8,
+            ha="center",
+        )
 
     def _draw_fivebar_side(
         self,
@@ -814,18 +996,49 @@ class RobotViewApp:
         if joint_angles is None:
             joint_angles = self._urdf_joint_angles()
         angles = np.asarray([joint_angles[name] for name in JOINT_ANGLE_NAMES], dtype=np.float64)
-        origins, rotations = compute_link_transforms(
-            self.tree_steps,
-            angles,
-            root_origin,
-            root_rotation,
-            scale,
-            len(self.link_order),
-        )
+        try:
+            origins, rotations = compute_link_transforms(
+                self.tree_steps,
+                angles,
+                root_origin,
+                root_rotation,
+                scale,
+                len(self.link_order),
+            )
+            self.backend_warning = ""
+        except RuntimeError as exc:
+            self.backend_warning = f"{exc} | display fallback active"
+            return self._urdf_link_transforms_python(root_origin, root_rotation, scale, joint_angles)
         return {
             name: (origins[index], rotations[index])
             for index, name in enumerate(self.link_order)
         }
+
+    def _urdf_link_transforms_python(
+        self,
+        root_origin: Vec3,
+        root_rotation: np.ndarray,
+        scale: float,
+        joint_angles: dict[str, float],
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        if self.urdf is None:
+            return {}
+        transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {self.urdf.root_link: (root_origin, root_rotation)}
+        stack = [self.urdf.root_link]
+        while stack:
+            parent = stack.pop()
+            parent_origin, parent_R = transforms[parent]
+            for joint in self.urdf.child_joints.get(parent, []):
+                joint_origin = parent_origin + (joint.origin_xyz * scale) @ parent_R.T
+                joint_R = parent_R @ rpy_matrix(joint.origin_rpy)
+                angle = joint_angles.get(joint.name, 0.0)
+                if joint.joint_type in {"revolute", "continuous"}:
+                    child_R = joint_R @ axis_angle_matrix(joint.axis, angle)
+                else:
+                    child_R = joint_R
+                transforms[joint.child] = (joint_origin, child_R)
+                stack.append(joint.child)
+        return transforms
 
     def _urdf_world_bounds(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> tuple[np.ndarray, np.ndarray]:
         if self.urdf is None:
@@ -880,6 +1093,10 @@ class RobotViewApp:
             "wheel_joint_left": math.radians(float(self.vars["wheel_left_deg"].get())),
         }
         if bool(self.vars["auto_passive"].get()):
+            status = solver_status()
+            if status.backend != "C":
+                self.backend_warning = f"C backend unavailable: {status.message} | auto-solve paused; display fallback active"
+                return angles
             dirty = set(self.solve_dirty_sides)
             if "right" in dirty:
                 right_calf_a, right_calf_b, right_error = self._solve_parallel_side(
@@ -1041,12 +1258,15 @@ class RobotViewApp:
             f"left closure={self.last_closure_error['left']:.5f} m | "
             f"right closure={self.last_closure_error['right']:.5f} m"
         )
+        if self.backend_warning:
+            status = f"{status} | {self.backend_warning}"
         self.status.configure(text=status)
         lines = [
             "Linkage telemetry",
             f"Render style: {self.vars['render_style'].get()}",
             f"Time: {self.state.t:6.2f} s",
-            f"Pitch/Roll: {float(self.vars['pitch'].get()):+.1f} / {float(self.vars['roll'].get()):+.1f} deg",
+            f"Balance pitch/roll: {self.balance_pitch_deg:+.2f} / {self.balance_roll_deg:+.2f} deg",
+            f"Balance tilt: {self.balance_tilt_deg:.2f} deg",
             f"Auto passive: {bool(self.vars['auto_passive'].get())}",
             f"Solver: {solver_status().backend}",
             f"Closure L/R: {self.last_closure_error['left']:.5f} / {self.last_closure_error['right']:.5f} m",
@@ -1054,6 +1274,8 @@ class RobotViewApp:
             f"Right calf A/B: {float(self.vars['right_calf_a_deg'].get()):+.2f} / {float(self.vars['right_calf_b_deg'].get()):+.2f} deg",
             "Mouse: rotate, pan, zoom in viewport",
         ]
+        if self.backend_warning:
+            lines.extend(["", self.backend_warning])
         if self.urdf is not None:
             lines.extend(
                 [

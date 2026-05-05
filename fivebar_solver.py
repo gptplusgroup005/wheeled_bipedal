@@ -102,6 +102,48 @@ def compute_link_transforms(
     return origins, rotations
 
 
+def compute_supported_link_transforms(
+    tree_steps: np.ndarray,
+    angles: np.ndarray,
+    support_origin: np.ndarray,
+    requested_root_rotation: np.ndarray,
+    scale: float,
+    link_count: int,
+    wheel_left_index: int,
+    wheel_right_index: int,
+    wheel_radius: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    tree_steps = _as_tree_steps(tree_steps)
+    angles = np.asarray(angles, dtype=np.float64)
+    support_origin = np.asarray(support_origin, dtype=np.float64)
+    requested_root_rotation = np.ascontiguousarray(np.asarray(requested_root_rotation, dtype=np.float64).reshape(9))
+    origins = np.zeros((link_count, 3), dtype=np.float64)
+    rotations = np.zeros((link_count, 3, 3), dtype=np.float64)
+
+    lib = _load_c_solver()
+    if lib is None:
+        raise RuntimeError(f"C backend is required for supported FK transforms: {_STATUS.message}")
+
+    ok = lib.compute_supported_link_transforms_c(
+        tree_steps.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.c_int(len(tree_steps)),
+        angles.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.c_int(len(angles)),
+        support_origin.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        requested_root_rotation.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.c_double(scale),
+        ctypes.c_int(link_count),
+        ctypes.c_int(wheel_left_index),
+        ctypes.c_int(wheel_right_index),
+        ctypes.c_double(wheel_radius),
+        origins.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        rotations.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+    )
+    if not ok:
+        raise RuntimeError("C backend failed to compute supported FK transforms")
+    return origins, rotations
+
+
 def solve_passive_pair(
     wheel_chain: np.ndarray,
     branch_chain: np.ndarray,
@@ -170,12 +212,12 @@ def _load_c_solver() -> ctypes.CDLL | None:
     base_dir = Path(__file__).resolve().parent
     source = base_dir / "fivebar_solver.c"
     build_dir = base_dir / "build"
-    library = build_dir / ("fivebar_solver.dll" if _is_windows() else "libfivebar_solver.so")
     if not source.exists():
         _STATUS = SolverStatus("unavailable", "fivebar_solver.c not found")
         return None
+    library = _library_for_source(source, build_dir)
 
-    if not library.exists() or library.stat().st_mtime < source.stat().st_mtime:
+    if not library.exists():
         _compile_c_solver(source, library)
 
     if not library.exists():
@@ -213,6 +255,22 @@ def _load_c_solver() -> ctypes.CDLL | None:
             ctypes.POINTER(ctypes.c_double),
         ]
         lib.compute_link_transforms_c.restype = ctypes.c_int
+        lib.compute_supported_link_transforms_c.argtypes = [
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_double,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_double,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        lib.compute_supported_link_transforms_c.restype = ctypes.c_int
         _LIB = lib
         _STATUS = SolverStatus("C", str(library))
         return _LIB
@@ -226,11 +284,14 @@ def _compile_c_solver(source: Path, library: Path) -> None:
     library.parent.mkdir(exist_ok=True)
     commands = []
     if _is_windows():
+        msvc_command = _msvc_build_command(source, library)
+        if msvc_command:
+            commands.append(msvc_command)
         commands.extend(
             [
                 ["gcc", "-O3", "-shared", "-o", str(library), str(source)],
                 ["clang", "-O3", "-shared", "-o", str(library), str(source)],
-                ["cl", "/O2", "/LD", str(source), f"/Fe:{library}"],
+                ["cl", "/O2", "/LD", str(source), f"/Fe:{library}", f"/Fo:{library.with_suffix('.obj')}"],
             ]
         )
     else:
@@ -245,7 +306,15 @@ def _compile_c_solver(source: Path, library: Path) -> None:
     last_error = ""
     for command in commands:
         try:
-            result = subprocess.run(command, cwd=source.parent, capture_output=True, text=True, timeout=20, check=False)
+            result = subprocess.run(
+                command,
+                cwd=source.parent,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+                shell=isinstance(command, str),
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             last_error = str(exc)
             continue
@@ -258,3 +327,29 @@ def _compile_c_solver(source: Path, library: Path) -> None:
 
 def _is_windows() -> bool:
     return hasattr(ctypes, "WinDLL")
+
+
+def _library_for_source(source: Path, build_dir: Path) -> Path:
+    version = source.stat().st_mtime_ns
+    if _is_windows():
+        return build_dir / f"fivebar_solver_{version}.dll"
+    return build_dir / f"libfivebar_solver_{version}.so"
+
+
+def _msvc_build_command(source: Path, library: Path) -> str | None:
+    candidates = [
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"),
+    ]
+    vcvars = next((path for path in candidates if path.exists()), None)
+    if vcvars is None:
+        return None
+
+    import_lib = library.with_name(f"{library.stem}_import.lib")
+    return (
+        f'call "{vcvars}" && '
+        f'cl /O2 /LD "{source}" /Fe"{library}" /Fo"{library.with_suffix(".obj")}" '
+        f'/link /implib:"{import_lib}"'
+    )

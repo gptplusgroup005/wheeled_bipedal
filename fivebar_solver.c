@@ -3,6 +3,11 @@
 
 #define STEP_WIDTH 16
 #define TREE_STEP_WIDTH 13
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static void axis_angle(const double axis_in[3], double angle, double out[9]);
 
 static void mat_identity(double m[9]) {
     for (int i = 0; i < 9; ++i) {
@@ -32,6 +37,52 @@ static void mat_vec(const double m[9], const double v[3], double out[3]) {
     out[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2];
     out[1] = m[3] * v[0] + m[4] * v[1] + m[5] * v[2];
     out[2] = m[6] * v[0] + m[7] * v[1] + m[8] * v[2];
+}
+
+static double vec_norm(const double v[3]) {
+    return sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+static void rotation_between_vectors(const double from_in[3], const double to_in[3], double out[9]) {
+    double from[3] = {from_in[0], from_in[1], from_in[2]};
+    double to[3] = {to_in[0], to_in[1], to_in[2]};
+    double from_n = vec_norm(from);
+    double to_n = vec_norm(to);
+    if (from_n < 1e-12 || to_n < 1e-12) {
+        mat_identity(out);
+        return;
+    }
+    for (int i = 0; i < 3; ++i) {
+        from[i] /= from_n;
+        to[i] /= to_n;
+    }
+
+    double dot = from[0] * to[0] + from[1] * to[1] + from[2] * to[2];
+    if (dot > 0.999999) {
+        mat_identity(out);
+        return;
+    }
+    if (dot < -0.999999) {
+        double axis[3] = {1.0, 0.0, 0.0};
+        if (fabs(from[0]) > 0.9) {
+            axis[0] = 0.0;
+            axis[1] = 1.0;
+        }
+        double cross[3] = {
+            from[1] * axis[2] - from[2] * axis[1],
+            from[2] * axis[0] - from[0] * axis[2],
+            from[0] * axis[1] - from[1] * axis[0],
+        };
+        axis_angle(cross, M_PI, out);
+        return;
+    }
+
+    double axis[3] = {
+        from[1] * to[2] - from[2] * to[1],
+        from[2] * to[0] - from[0] * to[2],
+        from[0] * to[1] - from[1] * to[0],
+    };
+    axis_angle(axis, acos(dot), out);
 }
 
 static void axis_angle(const double axis_in[3], double angle, double out[9]) {
@@ -212,20 +263,27 @@ int solve_passive_pair_c(
         return 0;
     }
 
-    int sample_counts[4] = {25, 21, 17, 13};
+    int sample_counts[4] = {17, 13, 11, 9};
     double best_a = initial_a;
     double best_b = initial_b;
     double best_error = HUGE_VAL;
+    double best_score = HUGE_VAL;
     double center_a = initial_a;
     double center_b = initial_b;
-    double radius = (upper - lower) / 2.0;
+    const double branch_window = 0.55;
+    double search_lower_a = fmax(lower, initial_a - branch_window);
+    double search_upper_a = fmin(upper, initial_a + branch_window);
+    double search_lower_b = fmax(lower, initial_b - branch_window);
+    double search_upper_b = fmin(upper, initial_b + branch_window);
+    double radius = fmin((upper - lower) / 2.0, branch_window);
+    const double continuity_weight = 0.015;
 
     for (int level = 0; level < 4; ++level) {
         int samples = sample_counts[level];
-        double a0 = fmax(lower, center_a - radius);
-        double a1 = fmin(upper, center_a + radius);
-        double b0 = fmax(lower, center_b - radius);
-        double b1 = fmin(upper, center_b + radius);
+        double a0 = fmax(search_lower_a, center_a - radius);
+        double a1 = fmin(search_upper_a, center_a + radius);
+        double b0 = fmax(search_lower_b, center_b - radius);
+        double b1 = fmin(search_upper_b, center_b + radius);
 
         for (int ia = 0; ia < samples; ++ia) {
             double a = samples == 1 ? a0 : a0 + (a1 - a0) * (double)ia / (double)(samples - 1);
@@ -244,7 +302,11 @@ int solve_passive_pair_c(
                     a,
                     b
                 );
-                if (error < best_error) {
+                double da = a - initial_a;
+                double db = b - initial_b;
+                double score = error + continuity_weight * (da * da + db * db);
+                if (score < best_score) {
+                    best_score = score;
                     best_error = error;
                     best_a = a;
                     best_b = b;
@@ -262,10 +324,7 @@ int solve_passive_pair_c(
     return isfinite(best_error) ? 1 : 0;
 }
 
-#ifdef _WIN32
-__declspec(dllexport)
-#endif
-int compute_link_transforms_c(
+static int compute_tree_transforms(
     const double *tree_steps,
     int step_count,
     const double *angles,
@@ -331,4 +390,132 @@ int compute_link_transforms_c(
     }
 
     return 1;
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int compute_link_transforms_c(
+    const double *tree_steps,
+    int step_count,
+    const double *angles,
+    int angle_count,
+    const double *root_origin,
+    const double *root_rotation,
+    double scale,
+    int link_count,
+    double *out_origins,
+    double *out_rotations
+) {
+    return compute_tree_transforms(
+        tree_steps,
+        step_count,
+        angles,
+        angle_count,
+        root_origin,
+        root_rotation,
+        scale,
+        link_count,
+        out_origins,
+        out_rotations
+    );
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int compute_supported_link_transforms_c(
+    const double *tree_steps,
+    int step_count,
+    const double *angles,
+    int angle_count,
+    const double *support_origin,
+    const double *requested_root_rotation,
+    double scale,
+    int link_count,
+    int wheel_left_index,
+    int wheel_right_index,
+    double wheel_radius,
+    double *out_origins,
+    double *out_rotations
+) {
+    if (
+        !tree_steps || !angles || !support_origin || !requested_root_rotation || !out_origins || !out_rotations ||
+        link_count <= 0 || wheel_left_index < 0 || wheel_left_index >= link_count ||
+        wheel_right_index < 0 || wheel_right_index >= link_count
+    ) {
+        return 0;
+    }
+
+    double zero_origin[3] = {0.0, 0.0, 0.0};
+    if (!compute_tree_transforms(
+        tree_steps,
+        step_count,
+        angles,
+        angle_count,
+        zero_origin,
+        requested_root_rotation,
+        scale,
+        link_count,
+        out_origins,
+        out_rotations
+    )) {
+        return 0;
+    }
+
+    double *left = out_origins + (size_t)wheel_left_index * 3;
+    double *right = out_origins + (size_t)wheel_right_index * 3;
+    double wheel_line[3] = {left[0] - right[0], left[1] - right[1], left[2] - right[2]};
+    double horizontal_line[3] = {wheel_line[0], wheel_line[1], 0.0};
+    double aligned_root_rotation[9];
+    if (vec_norm(horizontal_line) > 1e-12) {
+        double correction[9];
+        rotation_between_vectors(wheel_line, horizontal_line, correction);
+        mat_mul(correction, requested_root_rotation, aligned_root_rotation);
+    } else {
+        for (int i = 0; i < 9; ++i) {
+            aligned_root_rotation[i] = requested_root_rotation[i];
+        }
+    }
+
+    if (!compute_tree_transforms(
+        tree_steps,
+        step_count,
+        angles,
+        angle_count,
+        zero_origin,
+        aligned_root_rotation,
+        scale,
+        link_count,
+        out_origins,
+        out_rotations
+    )) {
+        return 0;
+    }
+
+    left = out_origins + (size_t)wheel_left_index * 3;
+    right = out_origins + (size_t)wheel_right_index * 3;
+    double support_center[3] = {
+        (left[0] + right[0]) * 0.5,
+        (left[1] + right[1]) * 0.5,
+        (left[2] + right[2]) * 0.5,
+    };
+    double anchored_root_origin[3] = {
+        support_origin[0] - support_center[0],
+        support_origin[1] - support_center[1],
+        support_origin[2] + wheel_radius - support_center[2],
+    };
+
+    return compute_tree_transforms(
+        tree_steps,
+        step_count,
+        angles,
+        angle_count,
+        anchored_root_origin,
+        aligned_root_rotation,
+        scale,
+        link_count,
+        out_origins,
+        out_rotations
+    );
 }

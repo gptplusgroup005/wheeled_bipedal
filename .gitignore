@@ -18,9 +18,16 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+$null
 
 # Generated/export logs
 *.log
+
+# C backend build artifacts
+build/
+*.obj
+*.lib
+*.exp
 
 # Optional large generated simulation exports
 robot_urdf/urdf/robot.SLDASM/
