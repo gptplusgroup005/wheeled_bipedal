@@ -14,11 +14,29 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.colors import to_rgb
 from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+from fivebar_solver import make_step, solve_passive_pair, solver_status
 
 matplotlib.use("TkAgg")
 
 Vec3 = np.ndarray
+
+JOINT_ANGLE_NAMES = (
+    "pad_joint_right",
+    "thigh_joint_right_1",
+    "calf_joint_right_1",
+    "thigh_joint_right_2",
+    "calf_joint_right_2",
+    "wheel_joint_right",
+    "pad_joint_left",
+    "thigh_joint_left_1",
+    "calf_joint_left_1",
+    "thigh_joint_left_2",
+    "calf_joint_left_2",
+    "wheel_joint_left",
+)
+JOINT_ANGLE_INDEX = {name: index for index, name in enumerate(JOINT_ANGLE_NAMES)}
 
 @dataclass
 class RobotState:
@@ -406,11 +424,12 @@ class RobotViewApp:
         self.last_tick = time.perf_counter()
         self.last_render = 0.0
         self.last_text_update = 0.0
-        self.trail: list[tuple[float, float]] = []
         self.mesh: STLMesh | None = None
         self.mesh_error = ""
         self.urdf: URDFModel | None = None
         self.urdf_error = ""
+        self.solver_chains: dict[str, np.ndarray] = {}
+        self.last_closure_error: dict[str, float] = {"left": 0.0, "right": 0.0}
 
         self.vars: dict[str, tk.Variable] = {}
         self._build_vars()
@@ -423,21 +442,25 @@ class RobotViewApp:
 
     def _build_vars(self) -> None:
         defaults = {
-            "speed": 0.75,
-            "turn": 0.0,
-            "wheel_radius": 0.06,
-            "wheel_track": 0.42,
             "body_h": 1.75,
-            "terrain": 7.0,
-            "grid": 0.5,
-            "obstacle": True,
-            "ghost": True,
-            "show_axes": False,
+            "view_span": 4.0,
             "use_stl": True,
-            "display_mode": "URDF",
             "urdf_scale": 4.0,
             "urdf_detail": 12000.0,
             "show_joints": True,
+            "auto_passive": True,
+            "pad_left_deg": 0.0,
+            "pad_right_deg": 0.0,
+            "left_thigh_a_deg": 0.0,
+            "left_thigh_b_deg": 0.0,
+            "left_calf_a_deg": 0.0,
+            "left_calf_b_deg": 0.0,
+            "right_thigh_a_deg": 0.0,
+            "right_thigh_b_deg": 0.0,
+            "right_calf_a_deg": 0.0,
+            "right_calf_b_deg": 0.0,
+            "wheel_left_deg": 0.0,
+            "wheel_right_deg": 0.0,
             "mesh_detail": 5000.0,
             "live_detail": 800.0,
             "fps": 8.0,
@@ -476,6 +499,7 @@ class RobotViewApp:
             return
         try:
             self.urdf = load_urdf_model(urdf_path)
+            self.solver_chains.clear()
             self.urdf_error = ""
         except Exception as exc:
             self.urdf = None
@@ -549,54 +573,38 @@ class RobotViewApp:
 
         buttons = ttk.Frame(side, style="Panel.TFrame")
         buttons.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        for i in range(3):
-            buttons.columnconfigure(i, weight=1)
-        ttk.Button(buttons, text="Play", style="Run.TButton", command=self.play).grid(row=0, column=0, sticky="ew", padx=2, pady=2)
-        ttk.Button(buttons, text="Pause", command=self.pause).grid(row=0, column=1, sticky="ew", padx=2, pady=2)
-        ttk.Button(buttons, text="Reset", command=self.reset).grid(row=0, column=2, sticky="ew", padx=2, pady=2)
+        buttons.columnconfigure(0, weight=1)
+        ttk.Button(buttons, text="Reset angles", command=self.reset).grid(row=0, column=0, sticky="ew", padx=2, pady=2)
         row += 1
 
-        row = self._section(side, row, "Wheel Drive")
-        row = self._slider(side, row, "Forward speed", "speed", -2.0, 2.0, 0.01)
-        row = self._slider(side, row, "Turn rate", "turn", -1.8, 1.8, 0.01)
-        row = self._slider(side, row, "Wheel radius", "wheel_radius", 0.03, 0.12, 0.001)
-        row = self._slider(side, row, "Wheel track", "wheel_track", 0.25, 0.75, 0.01)
+        row = self._section(side, row, "5-Bar Linkage")
+        ttk.Checkbutton(side, text="Auto-solve passive calf joints", variable=self.vars["auto_passive"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
+        row += 1
+        row = self._slider(side, row, "Left pad deg", "pad_left_deg", -20, 20, 0.1)
+        row = self._slider(side, row, "Left motor A deg", "left_thigh_a_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Left motor B deg", "left_thigh_b_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Left calf A deg", "left_calf_a_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Left calf B deg", "left_calf_b_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Left wheel deg", "wheel_left_deg", -180, 180, 1)
+
+        row = self._section(side, row, "Right Linkage")
+        row = self._slider(side, row, "Right pad deg", "pad_right_deg", -20, 20, 0.1)
+        row = self._slider(side, row, "Right motor A deg", "right_thigh_a_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Right motor B deg", "right_thigh_b_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Right calf A deg", "right_calf_a_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Right calf B deg", "right_calf_b_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "Right wheel deg", "wheel_right_deg", -180, 180, 1)
 
         row = self._section(side, row, "Body Pose")
-        row = self._slider(side, row, "Body height", "body_h", 1.1, 2.6, 0.01)
         row = self._slider(side, row, "Pitch deg", "pitch", -18, 18, 0.1)
         row = self._slider(side, row, "Roll deg", "roll", -18, 18, 0.1)
 
-        row = self._section(side, row, "Robot Mesh")
-        display_mode = ttk.Combobox(
-            side,
-            textvariable=self.vars["display_mode"],
-            values=("URDF", "STL", "Wheel Placeholder"),
-            state="readonly",
-        )
-        display_mode.grid(row=row, column=0, sticky="ew", pady=(0, 6))
-        display_mode.bind("<<ComboboxSelected>>", lambda _event: self.draw_scene())
-        row += 1
-        ttk.Checkbutton(side, text="Use robot.stl fallback", variable=self.vars["use_stl"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
-        row += 1
+        row = self._section(side, row, "3D Display")
         row = self._slider(side, row, "URDF scale", "urdf_scale", 1.0, 8.0, 0.1)
         row = self._slider(side, row, "URDF triangles", "urdf_detail", 1000, 50000, 500)
-        row = self._slider(side, row, "Mesh triangles", "mesh_detail", 500, 50000, 500)
-        row = self._slider(side, row, "Live triangles", "live_detail", 100, 8000, 100)
-        row = self._slider(side, row, "Simulation FPS", "fps", 4, 30, 1)
         ttk.Checkbutton(side, text="Show URDF joint pivots", variable=self.vars["show_joints"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
         row += 1
         ttk.Checkbutton(side, text="Draw mesh edges", variable=self.vars["mesh_edges"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
-        row += 1
-
-        row = self._section(side, row, "Environment")
-        row = self._slider(side, row, "Terrain size", "terrain", 5, 14, 0.5)
-        row = self._slider(side, row, "Grid spacing", "grid", 0.25, 1.0, 0.05)
-        ttk.Checkbutton(side, text="Show obstacles", variable=self.vars["obstacle"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
-        row += 1
-        ttk.Checkbutton(side, text="Show trail", variable=self.vars["ghost"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
-        row += 1
-        ttk.Checkbutton(side, text="Show axes", variable=self.vars["show_axes"], command=self.draw_scene).grid(row=row, column=0, sticky="w", pady=2)
         row += 1
 
         row = self._section(side, row, "Camera")
@@ -650,7 +658,23 @@ class RobotViewApp:
     def reset(self) -> None:
         self.running = False
         self.state = RobotState()
-        self.trail.clear()
+        for key in (
+            "pad_left_deg",
+            "pad_right_deg",
+            "left_thigh_a_deg",
+            "left_thigh_b_deg",
+            "left_calf_a_deg",
+            "left_calf_b_deg",
+            "right_thigh_a_deg",
+            "right_thigh_b_deg",
+            "right_calf_a_deg",
+            "right_calf_b_deg",
+            "wheel_left_deg",
+            "wheel_right_deg",
+            "pitch",
+            "roll",
+        ):
+            self.vars[key].set(0.0)
         self.draw_scene()
 
     def _tick(self) -> None:
@@ -659,17 +683,6 @@ class RobotViewApp:
         self.last_tick = now
         if self.running:
             self.state.t += dt
-            self.state.yaw += float(self.vars["turn"].get()) * dt
-            speed = float(self.vars["speed"].get())
-            turn = float(self.vars["turn"].get())
-            self.state.x += math.cos(self.state.yaw) * speed * dt
-            self.state.y += math.sin(self.state.yaw) * speed * dt
-            wheel_radius = max(0.001, float(self.vars["wheel_radius"].get()))
-            wheel_track = float(self.vars["wheel_track"].get())
-            self.state.left_wheel -= (speed - turn * wheel_track / 2.0) * dt / wheel_radius
-            self.state.right_wheel -= (speed + turn * wheel_track / 2.0) * dt / wheel_radius
-            self.trail.append((self.state.x, self.state.y))
-            self.trail = self.trail[-140:]
             fps = max(1.0, float(self.vars["fps"].get()))
             if now - self.last_render >= 1.0 / fps:
                 self.last_render = now
@@ -685,43 +698,16 @@ class RobotViewApp:
         self.ax.clear()
         self.ax.set_facecolor("#eef1f5")
         self.fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
-        self._draw_environment()
         self._draw_robot()
         self._set_camera()
         self._update_text()
         self.canvas.draw_idle()
 
-    def _draw_environment(self) -> None:
-        terrain = float(self.vars["terrain"].get())
-        grid = float(self.vars["grid"].get())
-        span = np.arange(-terrain, terrain + grid, grid)
-        lines = []
-        for p in span:
-            lines.append([(-terrain, p, 0), (terrain, p, 0)])
-            lines.append([(p, -terrain, 0), (p, terrain, 0)])
-        self.ax.add_collection3d(Line3DCollection(lines, colors="#cbd3df", linewidths=0.55, alpha=0.85))
-        axes = [[(-terrain, 0, 0.002), (terrain, 0, 0.002)], [(0, -terrain, 0.002), (0, terrain, 0.002)]]
-        self.ax.add_collection3d(Line3DCollection(axes, colors="#64748b", linewidths=1.2))
-
-        if bool(self.vars["obstacle"].get()):
-            obstacles = [
-                ((1.8, -1.15, 0.13), (0.85, 0.42, 0.26)),
-                ((-1.5, 1.35, 0.08), (0.7, 0.7, 0.16)),
-                ((2.8, 1.7, 0.22), (0.35, 1.15, 0.44)),
-            ]
-            for center, size in obstacles:
-                self._add_faces(box_faces(np.array(center), size), "#a7b3c2", alpha=0.72, edge="#6b7280")
-
-        if bool(self.vars["ghost"].get()) and len(self.trail) > 1:
-            xs, ys = zip(*self.trail)
-            self.ax.plot(xs, ys, [0.035] * len(xs), color="#2f80ed", linewidth=2.0, alpha=0.75)
-
     def _draw_robot(self) -> None:
-        mode = str(self.vars["display_mode"].get())
-        if mode == "URDF" and self.urdf is not None:
+        if self.urdf is not None:
             self._draw_urdf_robot()
             return
-        if mode == "STL" and self.mesh is not None and bool(self.vars["use_stl"].get()):
+        if self.mesh is not None and bool(self.vars["use_stl"].get()):
             self._draw_stl_robot()
             return
 
@@ -729,8 +715,8 @@ class RobotViewApp:
 
     def _draw_wheel_biped_placeholder(self) -> None:
         R = self.body_rotation()
-        wheel_radius = float(self.vars["wheel_radius"].get())
-        wheel_track = float(self.vars["wheel_track"].get())
+        wheel_radius = 0.16
+        wheel_track = 0.62
         body_h = max(float(self.vars["body_h"].get()), wheel_radius * 2.4)
         origin = np.array([self.state.x, self.state.y, body_h])
 
@@ -754,9 +740,8 @@ class RobotViewApp:
         if self.urdf is None:
             return
         body_R = self.body_rotation()
-        body_h = float(self.vars["body_h"].get())
         scale = float(self.vars["urdf_scale"].get())
-        body_origin = np.array([self.state.x, self.state.y, body_h])
+        body_origin = np.array([self.state.x, self.state.y, 0.0])
         root_R = body_R @ rot_z(math.radians(90.0))
         root_origin = body_origin.copy()
         transforms = self._urdf_link_transforms(root_origin, root_R, scale)
@@ -800,12 +785,19 @@ class RobotViewApp:
             if len(points):
                 self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=10, color="#2563eb", depthshade=False)
 
-    def _urdf_link_transforms(self, root_origin: Vec3, root_rotation: np.ndarray, scale: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def _urdf_link_transforms(
+        self,
+        root_origin: Vec3,
+        root_rotation: np.ndarray,
+        scale: float,
+        joint_angles: dict[str, float] | None = None,
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         if self.urdf is None:
             return {}
         transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {self.urdf.root_link: (root_origin, root_rotation)}
         stack = [self.urdf.root_link]
-        joint_angles = self._urdf_joint_angles()
+        if joint_angles is None:
+            joint_angles = self._urdf_joint_angles()
         while stack:
             parent = stack.pop()
             parent_origin, parent_R = transforms[parent]
@@ -843,21 +835,115 @@ class RobotViewApp:
         return bounds_min, bounds_max
 
     def _urdf_joint_angles(self) -> dict[str, float]:
-        # Wheel-bipedal drive: linkage pose stays assembled while wheel joints roll.
-        return {
-            "pad_joint_right": 0.0,
-            "thigh_joint_right_1": 0.0,
-            "calf_joint_right_1": 0.0,
-            "thigh_joint_right_2": 0.0,
-            "calf_joint_right_2": 0.0,
-            "wheel_joint_right": self.state.right_wheel,
-            "pad_joint_left": 0.0,
-            "thigh_joint_left_1": 0.0,
-            "calf_joint_left_1": 0.0,
-            "thigh_joint_left_2": 0.0,
-            "calf_joint_left_2": 0.0,
-            "wheel_joint_left": self.state.left_wheel,
+        angles = {
+            "pad_joint_right": math.radians(float(self.vars["pad_right_deg"].get())),
+            "thigh_joint_right_1": math.radians(float(self.vars["right_thigh_a_deg"].get())),
+            "calf_joint_right_1": math.radians(float(self.vars["right_calf_a_deg"].get())),
+            "thigh_joint_right_2": math.radians(float(self.vars["right_thigh_b_deg"].get())),
+            "calf_joint_right_2": math.radians(float(self.vars["right_calf_b_deg"].get())),
+            "wheel_joint_right": math.radians(float(self.vars["wheel_right_deg"].get())),
+            "pad_joint_left": math.radians(float(self.vars["pad_left_deg"].get())),
+            "thigh_joint_left_1": math.radians(float(self.vars["left_thigh_a_deg"].get())),
+            "calf_joint_left_1": math.radians(float(self.vars["left_calf_a_deg"].get())),
+            "thigh_joint_left_2": math.radians(float(self.vars["left_thigh_b_deg"].get())),
+            "calf_joint_left_2": math.radians(float(self.vars["left_calf_b_deg"].get())),
+            "wheel_joint_left": math.radians(float(self.vars["wheel_left_deg"].get())),
         }
+        self.last_closure_error = {"left": 0.0, "right": 0.0}
+        if bool(self.vars["auto_passive"].get()):
+            right_calf_a, right_calf_b, right_error = self._solve_parallel_side(
+                angles,
+                calf_a="calf_joint_right_1",
+                calf_b="calf_joint_right_2",
+                wheel_link="wheel_link_right",
+                branch_b_link="calf_right_link_2",
+                loop_origin=np.array([-0.18, -0.03, 0.0]),
+            )
+            left_calf_a, left_calf_b, left_error = self._solve_parallel_side(
+                angles,
+                calf_a="calf_joint_left_1",
+                calf_b="calf_joint_left_2",
+                wheel_link="wheel_link_left",
+                branch_b_link="calf_left_link_2",
+                loop_origin=np.array([-0.18, 0.03, 0.0]),
+            )
+            angles["calf_joint_right_1"] = right_calf_a
+            angles["calf_joint_right_2"] = right_calf_b
+            angles["calf_joint_left_1"] = left_calf_a
+            angles["calf_joint_left_2"] = left_calf_b
+            self.vars["right_calf_a_deg"].set(round(math.degrees(right_calf_a), 3))
+            self.vars["right_calf_b_deg"].set(round(math.degrees(right_calf_b), 3))
+            self.vars["left_calf_a_deg"].set(round(math.degrees(left_calf_a), 3))
+            self.vars["left_calf_b_deg"].set(round(math.degrees(left_calf_b), 3))
+            self.last_closure_error = {"left": left_error, "right": right_error}
+        return angles
+
+    def _solve_parallel_side(
+        self,
+        base_angles: dict[str, float],
+        calf_a: str,
+        calf_b: str,
+        wheel_link: str,
+        branch_b_link: str,
+        loop_origin: np.ndarray,
+    ) -> tuple[float, float, float]:
+        angles = np.asarray([base_angles[name] for name in JOINT_ANGLE_NAMES], dtype=np.float64)
+        return solve_passive_pair(
+            self._solver_chain(wheel_link),
+            self._solver_chain(branch_b_link),
+            angles,
+            passive_a_index=JOINT_ANGLE_INDEX[calf_a],
+            passive_b_index=JOINT_ANGLE_INDEX[calf_b],
+            loop_origin=loop_origin,
+            initial_a=base_angles[calf_a],
+            initial_b=base_angles[calf_b],
+            lower=math.radians(-90.0),
+            upper=math.radians(90.0),
+        )
+
+    def _solver_chain(self, target_link: str) -> np.ndarray:
+        if target_link in self.solver_chains:
+            return self.solver_chains[target_link]
+        if self.urdf is None:
+            return np.empty((0, 16), dtype=np.float64)
+
+        by_child = {joint.child: joint for joint in self.urdf.joints}
+        joints: list[URDFJoint] = []
+        link = target_link
+        while link in by_child:
+            joint = by_child[link]
+            joints.append(joint)
+            link = joint.parent
+            if link == self.urdf.root_link:
+                break
+        joints.reverse()
+        steps = [
+            make_step(
+                joint.origin_xyz,
+                rpy_matrix(joint.origin_rpy),
+                joint.axis,
+                JOINT_ANGLE_INDEX.get(joint.name, -1) if joint.joint_type in {"revolute", "continuous"} else -1,
+            )
+            for joint in joints
+        ]
+        chain = np.vstack(steps) if steps else np.empty((0, 16), dtype=np.float64)
+        self.solver_chains[target_link] = chain
+        return chain
+
+    def _parallel_closure_error(
+        self,
+        joint_angles: dict[str, float],
+        wheel_link: str,
+        branch_b_link: str,
+        loop_origin: np.ndarray,
+    ) -> float:
+        transforms = self._urdf_link_transforms(np.zeros(3), np.eye(3), 1.0, joint_angles)
+        if wheel_link not in transforms or branch_b_link not in transforms:
+            return math.inf
+        wheel_center = transforms[wheel_link][0]
+        branch_origin, branch_rotation = transforms[branch_b_link]
+        branch_tip = branch_origin + loop_origin @ branch_rotation.T
+        return float(np.linalg.norm(wheel_center - branch_tip))
 
     def _urdf_face_colors(self, visual: MeshVisual, indices: np.ndarray, rotation: np.ndarray) -> np.ndarray:
         base = np.array(visual.color[:3])
@@ -948,17 +1034,16 @@ class RobotViewApp:
         self.ax.add_collection3d(collection)
 
     def _set_camera(self) -> None:
-        terrain = float(self.vars["terrain"].get())
+        view_span = float(self.vars["view_span"].get())
         center_x, center_y = self.state.x, self.state.y
-        span = max(terrain, 3.2)
+        span = max(view_span, 2.4)
         self.ax.set_xlim(center_x - span, center_x + span)
         self.ax.set_ylim(center_y - span, center_y + span)
-        mode = str(self.vars["display_mode"].get())
-        if mode == "URDF" and self.urdf is not None:
+        if self.urdf is not None:
             urdf_scale = float(self.vars["urdf_scale"].get())
-            top = float(self.vars["body_h"].get()) + max(1.2, float(self.urdf.bounds_max[2] - self.urdf.bounds_min[2]) * urdf_scale) + 0.35
+            top = max(1.2, float(self.urdf.bounds_max[2] - self.urdf.bounds_min[2]) * urdf_scale) + 0.55
             self.ax.set_zlim(0, max(2.4, top))
-        elif mode == "STL" and self.mesh is not None and bool(self.vars["use_stl"].get()):
+        elif self.mesh is not None and bool(self.vars["use_stl"].get()):
             top = float(self.vars["body_h"].get()) + float(self.mesh.local_max[2]) + 0.35
             self.ax.set_zlim(0, max(3.0, top))
         else:
@@ -967,8 +1052,7 @@ class RobotViewApp:
         self.ax.set_xlabel("X")
         self.ax.set_ylabel("Y")
         self.ax.set_zlabel("Z")
-        if not bool(self.vars["show_axes"].get()):
-            self.ax.set_axis_off()
+        self.ax.set_axis_off()
 
         camera = str(self.vars["camera"].get())
         if camera == "Front":
@@ -985,31 +1069,25 @@ class RobotViewApp:
         if self.running and now - self.last_text_update < 0.25:
             return
         self.last_text_update = now
-        speed = float(self.vars["speed"].get())
-        turn = float(self.vars["turn"].get())
-        wheel_radius = max(0.001, float(self.vars["wheel_radius"].get()))
-        wheel_track = float(self.vars["wheel_track"].get())
-        left_wheel_speed = -(speed - turn * wheel_track / 2.0) / wheel_radius
-        right_wheel_speed = -(speed + turn * wheel_track / 2.0) / wheel_radius
         status = (
-            f"{'RUNNING' if self.running else 'PAUSED'} | "
-            f"x={self.state.x:+.2f} y={self.state.y:+.2f} yaw={math.degrees(self.state.yaw):+.1f} deg | "
-            f"speed={float(self.vars['speed'].get()):+.2f} m/s"
+            f"{'UPDATING' if self.running else 'STATIC'} | "
+            f"solver={solver_status().backend} | "
+            f"left closure={self.last_closure_error['left']:.5f} m | "
+            f"right closure={self.last_closure_error['right']:.5f} m"
         )
         self.status.configure(text=status)
         lines = [
-            "Live telemetry",
-            f"Display: {self.vars['display_mode'].get()}",
+            "Linkage telemetry",
             f"Time: {self.state.t:6.2f} s",
-            f"Body height: {float(self.vars['body_h'].get()):.2f} m",
             f"Pitch/Roll: {float(self.vars['pitch'].get()):+.1f} / {float(self.vars['roll'].get()):+.1f} deg",
-            f"Wheel L/R: {self.state.left_wheel:+.1f} / {self.state.right_wheel:+.1f} rad",
-            f"Wheel speed L/R: {left_wheel_speed:+.1f} / {right_wheel_speed:+.1f} rad/s",
-            f"Trail points: {len(self.trail)}",
+            f"Auto passive: {bool(self.vars['auto_passive'].get())}",
+            f"Solver: {solver_status().backend}",
+            f"Closure L/R: {self.last_closure_error['left']:.5f} / {self.last_closure_error['right']:.5f} m",
+            f"Left calf A/B: {float(self.vars['left_calf_a_deg'].get()):+.2f} / {float(self.vars['left_calf_b_deg'].get()):+.2f} deg",
+            f"Right calf A/B: {float(self.vars['right_calf_a_deg'].get()):+.2f} / {float(self.vars['right_calf_b_deg'].get()):+.2f} deg",
             "Mouse: rotate, pan, zoom in viewport",
         ]
-        mode = str(self.vars["display_mode"].get())
-        if mode == "URDF" and self.urdf is not None:
+        if self.urdf is not None:
             lines.extend(
                 [
                     "",
@@ -1020,9 +1098,9 @@ class RobotViewApp:
                     f"Source triangles: {self.urdf.triangle_count:,}",
                 ]
             )
-        elif mode == "URDF" and self.urdf_error:
+        elif self.urdf_error:
             lines.extend(["", self.urdf_error])
-        elif mode == "STL" and self.mesh is not None:
+        elif self.mesh is not None:
             lines.extend(
                 [
                     "",
