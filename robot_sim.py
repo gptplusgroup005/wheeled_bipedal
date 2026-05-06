@@ -313,6 +313,7 @@ class RobotViewApp:
         self.link_index: dict[str, int] = {}
         self.tree_steps = np.empty((0, 13), dtype=np.float64)
         self.last_closure_error: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self.end_effector_positions: dict[str, np.ndarray] = {}
         self.backend_warning = ""
         self.balance_tilt_deg = 0.0
         self.balance_roll_deg = 0.0
@@ -331,9 +332,6 @@ class RobotViewApp:
             "render_style": "Linkage",
             "urdf_scale": 4.0,
             "show_joints": True,
-            "auto_passive": True,
-            "pad_left_deg": 0.0,
-            "pad_right_deg": 0.0,
             "left_thigh_a_deg": 0.0,
             "left_thigh_b_deg": 0.0,
             "left_calf_a_deg": 0.0,
@@ -342,8 +340,6 @@ class RobotViewApp:
             "right_thigh_b_deg": 0.0,
             "right_calf_a_deg": 0.0,
             "right_calf_b_deg": 0.0,
-            "wheel_left_deg": 0.0,
-            "wheel_right_deg": 0.0,
             "mesh_edges": True,
             "camera": "ISO",
 
@@ -488,23 +484,13 @@ class RobotViewApp:
         ttk.Button(buttons, text="Reset angles", command=self.reset).grid(row=0, column=0, sticky="ew", padx=2, pady=2)
         row += 1
 
-        row = self._section(side, row, "5-Bar Linkage")
-        ttk.Checkbutton(side, text="Auto-solve passive calf joints", variable=self.vars["auto_passive"], command=lambda: self.queue_draw(force_solve=True)).grid(row=row, column=0, sticky="w", pady=2)
-        row += 1
-        row = self._slider(side, row, "Left pad deg", "pad_left_deg", -20, 20, 0.1)
-        row = self._slider(side, row, "Left motor A deg", "left_thigh_a_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Left motor B deg", "left_thigh_b_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Left calf A deg", "left_calf_a_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Left calf B deg", "left_calf_b_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Left wheel deg", "wheel_left_deg", -180, 180, 1)
+        row = self._section(side, row, "Left Active Joints")
+        row = self._slider(side, row, "A1 active deg", "left_thigh_a_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "A2 active deg", "left_thigh_b_deg", -90, 90, 0.1)
 
-        row = self._section(side, row, "Right Linkage")
-        row = self._slider(side, row, "Right pad deg", "pad_right_deg", -20, 20, 0.1)
-        row = self._slider(side, row, "Right motor A deg", "right_thigh_a_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Right motor B deg", "right_thigh_b_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Right calf A deg", "right_calf_a_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Right calf B deg", "right_calf_b_deg", -90, 90, 0.1)
-        row = self._slider(side, row, "Right wheel deg", "wheel_right_deg", -180, 180, 1)
+        row = self._section(side, row, "Right Active Joints")
+        row = self._slider(side, row, "A1 active deg", "right_thigh_a_deg", -90, 90, 0.1)
+        row = self._slider(side, row, "A2 active deg", "right_thigh_b_deg", -90, 90, 0.1)
 
         row = self._section(side, row, "3D Display")
         render_style = ttk.Combobox(
@@ -530,7 +516,7 @@ class RobotViewApp:
         ttk.Button(side, text="Snapshot redraw", command=lambda: self.draw_scene(reset_camera=False)).grid(row=row, column=0, sticky="ew", pady=4)
         row += 1
 
-        self.readout = tk.Text(side, height=8, width=36, relief="solid", bd=1, bg="#ffffff", fg="#1f2937")
+        self.readout = tk.Text(side, height=10, width=36, relief="solid", bd=1, bg="#ffffff", fg="#1f2937")
         self.readout.grid(row=row, column=0, sticky="ew", pady=(10, 0))
         self.readout.configure(state="disabled")
 
@@ -565,8 +551,6 @@ class RobotViewApp:
     def reset(self) -> None:
         self.state = RobotState()
         for key in (
-            "pad_left_deg",
-            "pad_right_deg",
             "left_thigh_a_deg",
             "left_thigh_b_deg",
             "left_calf_a_deg",
@@ -575,8 +559,6 @@ class RobotViewApp:
             "right_thigh_b_deg",
             "right_calf_a_deg",
             "right_calf_b_deg",
-            "wheel_left_deg",
-            "wheel_right_deg",
         ):
             self.vars[key].set(0.0)
         self.solve_dirty_sides = {"left", "right"}
@@ -597,9 +579,9 @@ class RobotViewApp:
             return
         if changed_key is None:
             return
-        if changed_key.startswith("left_") or changed_key in {"pad_left_deg", "wheel_left_deg"}:
+        if changed_key in {"left_thigh_a_deg", "left_thigh_b_deg"}:
             self.solve_dirty_sides.add("left")
-        elif changed_key.startswith("right_") or changed_key in {"pad_right_deg", "wheel_right_deg"}:
+        elif changed_key in {"right_thigh_a_deg", "right_thigh_b_deg"}:
             self.solve_dirty_sides.add("right")
 
     def _run_queued_draw(self) -> None:
@@ -639,6 +621,7 @@ class RobotViewApp:
         root_R = body_R @ rot_z(math.radians(90.0))
         joint_angles = self._urdf_joint_angles()
         transforms = self._urdf_supported_link_transforms(body_origin, root_R, scale, joint_angles)
+        self._update_end_effector_positions(transforms)
 
         if str(self.vars["render_style"].get()) == "Linkage":
             self._draw_linkage_diagram(transforms, scale)
@@ -657,6 +640,13 @@ class RobotViewApp:
             points = np.asarray([value[0] for name, value in transforms.items() if name != self.urdf.root_link])
             if len(points):
                 self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=18, color="#1d4ed8", edgecolors="#ffffff", linewidths=0.45, depthshade=False)
+
+    def _update_end_effector_positions(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
+        self.end_effector_positions = {
+            side: transforms[link_name][0].copy()
+            for side, link_name in (("left", "wheel_link_left"), ("right", "wheel_link_right"))
+            if link_name in transforms
+        }
 
     def _support_aligned_root_rotation(
         self,
@@ -838,8 +828,6 @@ class RobotViewApp:
             "B1": f"calf_{side}_link_1",
             "B2": f"calf_{side}_link_2",
             "P": f"wheel_link_{side}",
-            "pad": f"pad_link_{side}",
-            "hip": f"hip_frame_link_{side}",
         }
         if any(link not in transforms for link in required.values()):
             return
@@ -849,27 +837,27 @@ class RobotViewApp:
         B1 = transforms[required["B1"]][0]
         B2 = transforms[required["B2"]][0]
         P = transforms[required["P"]][0]
-        pad = transforms[required["pad"]][0]
-        hip = transforms[required["hip"]][0]
 
-        self._plot_link(A1, A2, "#d1d5db", linewidth=1.5)
-        self._plot_link(pad, hip, "#d1d5db", linewidth=2.0)
+        active_color = "#111827"
+        passive_color = link_color
+        base_color = "#d1d5db"
+        self._plot_link(A1, A2, base_color, linewidth=1.5)
         self._plot_link(A1, B1, link_color, linewidth=3.0)
         self._plot_link(A2, B2, link_color, linewidth=3.0)
-        self._plot_link(B1, P, link_color, linewidth=3.0)
-        self._plot_link(B2, P, link_color, linewidth=3.0)
+        self._plot_link(B1, P, passive_color, linewidth=3.0)
+        self._plot_link(B2, P, passive_color, linewidth=3.0)
 
         wheel_radius = self._link_radius(required["P"], scale, fallback=0.045 * scale)
         self._draw_cylinder(P, wheel_radius, 0.018 * scale, "y", transforms[required["P"]][1], "#2d3340", edge_color="#151922", segments=32)
 
-        self._plot_point(A1, "A1", fill="#000000")
-        self._plot_point(A2, "A2", fill="#000000")
-        self._plot_point(B1, "B1", fill="#333333")
-        self._plot_point(B2, "B2", fill="#333333")
-        self._plot_point(P, "P", fill=point_color, size=42)
+        self._plot_point(A1, "A1", fill=active_color, size=46)
+        self._plot_point(A2, "A2", fill=active_color, size=46)
+        self._plot_point(B1, "B1", fill="#6b7280", size=34)
+        self._plot_point(B2, "B2", fill="#6b7280", size=34)
+        self._plot_point(P, "P", fill=point_color, size=52)
 
         label_anchor = (A1 + A2) * 0.5
-        self.ax.text(label_anchor[0], label_anchor[1], label_anchor[2] + 0.05 * scale, side.upper(), color=link_color, fontsize=9, ha="center")
+        self.ax.text(label_anchor[0], label_anchor[1], label_anchor[2] + 0.05 * scale, side.upper(), color=active_color, fontsize=9, ha="center")
 
     def _plot_link(self, p0: Vec3, p1: Vec3, color: str, linewidth: float = 2.0) -> None:
         self.ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]], color=color, linewidth=linewidth, solid_capstyle="round")
@@ -1034,58 +1022,55 @@ class RobotViewApp:
 
     def _urdf_joint_angles(self) -> dict[str, float]:
         angles = {
-            "pad_joint_right": math.radians(float(self.vars["pad_right_deg"].get())),
+            "pad_joint_right": 0.0,
             "thigh_joint_right_1": math.radians(float(self.vars["right_thigh_a_deg"].get())),
             "calf_joint_right_1": math.radians(float(self.vars["right_calf_a_deg"].get())),
             "thigh_joint_right_2": math.radians(float(self.vars["right_thigh_b_deg"].get())),
             "calf_joint_right_2": math.radians(float(self.vars["right_calf_b_deg"].get())),
-            "wheel_joint_right": math.radians(float(self.vars["wheel_right_deg"].get())),
-            "pad_joint_left": math.radians(float(self.vars["pad_left_deg"].get())),
+            "wheel_joint_right": 0.0,
+            "pad_joint_left": 0.0,
             "thigh_joint_left_1": math.radians(float(self.vars["left_thigh_a_deg"].get())),
             "calf_joint_left_1": math.radians(float(self.vars["left_calf_a_deg"].get())),
             "thigh_joint_left_2": math.radians(float(self.vars["left_thigh_b_deg"].get())),
             "calf_joint_left_2": math.radians(float(self.vars["left_calf_b_deg"].get())),
-            "wheel_joint_left": math.radians(float(self.vars["wheel_left_deg"].get())),
+            "wheel_joint_left": 0.0,
         }
-        if bool(self.vars["auto_passive"].get()):
-            status = solver_status()
-            if status.backend != "C":
-                self.backend_warning = f"C backend unavailable: {status.message} | auto-solve paused; display fallback active"
-                return angles
-            dirty = set(self.solve_dirty_sides)
-            if "right" in dirty:
-                right_calf_a, right_calf_b, right_error = self._solve_parallel_side(
-                    angles,
-                    calf_a="calf_joint_right_1",
-                    calf_b="calf_joint_right_2",
-                    wheel_link="wheel_link_right",
-                    branch_b_link="calf_right_link_2",
-                    loop_origin=np.array([-0.18, -0.03, 0.0]),
-                )
-                angles["calf_joint_right_1"] = right_calf_a
-                angles["calf_joint_right_2"] = right_calf_b
-                self.vars["right_calf_a_deg"].set(round(math.degrees(right_calf_a), 3))
-                self.vars["right_calf_b_deg"].set(round(math.degrees(right_calf_b), 3))
-                self.last_closure_error["right"] = right_error
+        status = solver_status()
+        if status.backend != "C":
+            self.backend_warning = f"C backend unavailable: {status.message} | passive joints paused"
+            return angles
+        dirty = set(self.solve_dirty_sides)
+        if "right" in dirty:
+            right_calf_a, right_calf_b, right_error = self._solve_parallel_side(
+                angles,
+                calf_a="calf_joint_right_1",
+                calf_b="calf_joint_right_2",
+                wheel_link="wheel_link_right",
+                branch_b_link="calf_right_link_2",
+                loop_origin=np.array([-0.18, -0.03, 0.0]),
+            )
+            angles["calf_joint_right_1"] = right_calf_a
+            angles["calf_joint_right_2"] = right_calf_b
+            self.vars["right_calf_a_deg"].set(round(math.degrees(right_calf_a), 3))
+            self.vars["right_calf_b_deg"].set(round(math.degrees(right_calf_b), 3))
+            self.last_closure_error["right"] = right_error
 
-            if "left" in dirty:
-                left_calf_a, left_calf_b, left_error = self._solve_parallel_side(
-                    angles,
-                    calf_a="calf_joint_left_1",
-                    calf_b="calf_joint_left_2",
-                    wheel_link="wheel_link_left",
-                    branch_b_link="calf_left_link_2",
-                    loop_origin=np.array([-0.18, 0.03, 0.0]),
-                )
-                angles["calf_joint_left_1"] = left_calf_a
-                angles["calf_joint_left_2"] = left_calf_b
-                self.vars["left_calf_a_deg"].set(round(math.degrees(left_calf_a), 3))
-                self.vars["left_calf_b_deg"].set(round(math.degrees(left_calf_b), 3))
-                self.last_closure_error["left"] = left_error
+        if "left" in dirty:
+            left_calf_a, left_calf_b, left_error = self._solve_parallel_side(
+                angles,
+                calf_a="calf_joint_left_1",
+                calf_b="calf_joint_left_2",
+                wheel_link="wheel_link_left",
+                branch_b_link="calf_left_link_2",
+                loop_origin=np.array([-0.18, 0.03, 0.0]),
+            )
+            angles["calf_joint_left_1"] = left_calf_a
+            angles["calf_joint_left_2"] = left_calf_b
+            self.vars["left_calf_a_deg"].set(round(math.degrees(left_calf_a), 3))
+            self.vars["left_calf_b_deg"].set(round(math.degrees(left_calf_b), 3))
+            self.last_closure_error["left"] = left_error
 
-            self.solve_dirty_sides.difference_update(dirty)
-        else:
-            self.last_closure_error = {"left": 0.0, "right": 0.0}
+        self.solve_dirty_sides.difference_update(dirty)
         return angles
 
     def _solve_parallel_side(
@@ -1219,16 +1204,19 @@ class RobotViewApp:
         lines = [
             "Linkage telemetry",
             f"Render style: {self.vars['render_style'].get()}",
-            f"Time: {self.state.t:6.2f} s",
+            f"Active A1/A2 L: {float(self.vars['left_thigh_a_deg'].get()):+.2f} / {float(self.vars['left_thigh_b_deg'].get()):+.2f} deg",
+            f"Active A1/A2 R: {float(self.vars['right_thigh_a_deg'].get()):+.2f} / {float(self.vars['right_thigh_b_deg'].get()):+.2f} deg",
             f"Balance pitch/roll: {self.balance_pitch_deg:+.2f} / {self.balance_roll_deg:+.2f} deg",
             f"Balance tilt: {self.balance_tilt_deg:.2f} deg",
-            f"Auto passive: {bool(self.vars['auto_passive'].get())}",
             f"Solver: {solver_status().backend}",
             f"Closure L/R: {self.last_closure_error['left']:.5f} / {self.last_closure_error['right']:.5f} m",
-            f"Left calf A/B: {float(self.vars['left_calf_a_deg'].get()):+.2f} / {float(self.vars['left_calf_b_deg'].get()):+.2f} deg",
-            f"Right calf A/B: {float(self.vars['right_calf_a_deg'].get()):+.2f} / {float(self.vars['right_calf_b_deg'].get()):+.2f} deg",
-            "Mouse: rotate, pan, zoom in viewport",
+            f"Passive B1/B2 L: {float(self.vars['left_calf_a_deg'].get()):+.2f} / {float(self.vars['left_calf_b_deg'].get()):+.2f} deg",
+            f"Passive B1/B2 R: {float(self.vars['right_calf_a_deg'].get()):+.2f} / {float(self.vars['right_calf_b_deg'].get()):+.2f} deg",
         ]
+        for side in ("left", "right"):
+            point = self.end_effector_positions.get(side)
+            if point is not None:
+                lines.append(f"End effector {side[0].upper()}: x={point[0]:+.3f} y={point[1]:+.3f} z={point[2]:+.3f} m")
         if self.backend_warning:
             lines.extend(["", self.backend_warning])
         if self.urdf is not None:
