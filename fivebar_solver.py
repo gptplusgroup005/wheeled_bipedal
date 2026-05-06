@@ -144,6 +144,26 @@ def compute_supported_link_transforms(
     return origins, rotations
 
 
+def load_stl_bounds(path: Path | str) -> tuple[np.ndarray, np.ndarray, int]:
+    path = Path(path)
+    lib = _load_c_solver()
+    if lib is None:
+        raise RuntimeError(f"C backend is required for STL bounds: {_STATUS.message}")
+
+    bounds_min = np.zeros(3, dtype=np.float64)
+    bounds_max = np.zeros(3, dtype=np.float64)
+    triangle_count = ctypes.c_int()
+    ok = lib.load_stl_bounds_c(
+        str(path).encode("utf-8"),
+        bounds_min.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        bounds_max.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.byref(triangle_count),
+    )
+    if not ok:
+        raise RuntimeError(f"C backend failed to read STL bounds: {path.name}")
+    return bounds_min, bounds_max, int(triangle_count.value)
+
+
 def solve_passive_pair(
     wheel_chain: np.ndarray,
     branch_chain: np.ndarray,
@@ -271,6 +291,13 @@ def _load_c_solver() -> ctypes.CDLL | None:
             ctypes.POINTER(ctypes.c_double),
         ]
         lib.compute_supported_link_transforms_c.restype = ctypes.c_int
+        lib.load_stl_bounds_c.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.load_stl_bounds_c.restype = ctypes.c_int
         _LIB = lib
         _STATUS = SolverStatus("C", str(library))
         return _LIB

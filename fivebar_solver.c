@@ -1,5 +1,9 @@
 #include <math.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define STEP_WIDTH 16
 #define TREE_STEP_WIDTH 13
@@ -8,6 +12,51 @@
 #endif
 
 static void axis_angle(const double axis_in[3], double angle, double out[9]);
+
+static uint32_t read_le_u32(const unsigned char bytes[4]) {
+    return ((uint32_t)bytes[0]) |
+           ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
+}
+
+static float read_le_f32(const unsigned char bytes[4]) {
+    uint32_t value = read_le_u32(bytes);
+    float out;
+    memcpy(&out, &value, sizeof(out));
+    return out;
+}
+
+static void include_vertex(double bounds_min[3], double bounds_max[3], double x, double y, double z) {
+    if (x < bounds_min[0]) bounds_min[0] = x;
+    if (y < bounds_min[1]) bounds_min[1] = y;
+    if (z < bounds_min[2]) bounds_min[2] = z;
+    if (x > bounds_max[0]) bounds_max[0] = x;
+    if (y > bounds_max[1]) bounds_max[1] = y;
+    if (z > bounds_max[2]) bounds_max[2] = z;
+}
+
+static int parse_ascii_vertex(const char *line, double bounds_min[3], double bounds_max[3], int *vertex_count) {
+    while (*line == ' ' || *line == '\t') {
+        ++line;
+    }
+    if (strncmp(line, "vertex", 6) != 0 || (line[6] != ' ' && line[6] != '\t')) {
+        return 1;
+    }
+    line += 6;
+    char *end = NULL;
+    double x = strtod(line, &end);
+    if (end == line) return 0;
+    line = end;
+    double y = strtod(line, &end);
+    if (end == line) return 0;
+    line = end;
+    double z = strtod(line, &end);
+    if (end == line) return 0;
+    include_vertex(bounds_min, bounds_max, x, y, z);
+    *vertex_count += 1;
+    return 1;
+}
 
 static void mat_identity(double m[9]) {
     for (int i = 0; i < 9; ++i) {
@@ -322,6 +371,100 @@ int solve_passive_pair_c(
     out[1] = best_b;
     out[2] = best_error;
     return isfinite(best_error) ? 1 : 0;
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int load_stl_bounds_c(
+    const char *path,
+    double *out_bounds_min,
+    double *out_bounds_max,
+    int *out_triangle_count
+) {
+    if (!path || !out_bounds_min || !out_bounds_max || !out_triangle_count) {
+        return 0;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return 0;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return 0;
+    }
+    long file_size = ftell(file);
+    if (file_size < 84 || fseek(file, 80, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
+    }
+
+    unsigned char count_bytes[4];
+    if (fread(count_bytes, 1, 4, file) != 4) {
+        fclose(file);
+        return 0;
+    }
+    uint32_t binary_count = read_le_u32(count_bytes);
+    int looks_binary = file_size == 84L + (long)binary_count * 50L;
+
+    double bounds_min[3] = {HUGE_VAL, HUGE_VAL, HUGE_VAL};
+    double bounds_max[3] = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+
+    if (looks_binary) {
+        if (fseek(file, 84, SEEK_SET) != 0) {
+            fclose(file);
+            return 0;
+        }
+        unsigned char record[50];
+        for (uint32_t tri = 0; tri < binary_count; ++tri) {
+            if (fread(record, 1, 50, file) != 50) {
+                fclose(file);
+                return 0;
+            }
+            for (int vertex = 0; vertex < 3; ++vertex) {
+                const unsigned char *base = record + 12 + vertex * 12;
+                include_vertex(
+                    bounds_min,
+                    bounds_max,
+                    (double)read_le_f32(base),
+                    (double)read_le_f32(base + 4),
+                    (double)read_le_f32(base + 8)
+                );
+            }
+        }
+        fclose(file);
+        out_triangle_count[0] = (int)binary_count;
+    } else {
+        fclose(file);
+        file = fopen(path, "r");
+        if (!file) {
+            return 0;
+        }
+        char line[512];
+        int vertex_count = 0;
+        while (fgets(line, sizeof(line), file)) {
+            if (!parse_ascii_vertex(line, bounds_min, bounds_max, &vertex_count)) {
+                fclose(file);
+                return 0;
+            }
+        }
+        fclose(file);
+        if (vertex_count < 3) {
+            return 0;
+        }
+        out_triangle_count[0] = vertex_count / 3;
+    }
+
+    if (!isfinite(bounds_min[0]) || !isfinite(bounds_max[0])) {
+        return 0;
+    }
+    for (int i = 0; i < 3; ++i) {
+        out_bounds_min[i] = bounds_min[i];
+        out_bounds_max[i] = bounds_max[i];
+    }
+    return 1;
 }
 
 static int compute_tree_transforms(

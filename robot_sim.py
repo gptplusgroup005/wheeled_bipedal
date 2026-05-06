@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import struct
 import time
 import tkinter as tk
 import xml.etree.ElementTree as ET
@@ -15,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from fivebar_solver import compute_link_transforms, compute_supported_link_transforms, make_step, make_tree_step, solve_passive_pair, solver_status
+from fivebar_solver import compute_link_transforms, compute_supported_link_transforms, load_stl_bounds, make_step, make_tree_step, solve_passive_pair, solver_status
 
 matplotlib.use("TkAgg")
 
@@ -208,48 +207,6 @@ def cylinder_mesh(
         rotation = np.eye(3)
     pts = transform(pts.reshape(-1, 3), np.asarray(center, dtype=float), rotation).reshape(pts.shape)
     return pts[:, :, 0], pts[:, :, 1], pts[:, :, 2]
-
-def load_stl_bounds(path: Path) -> tuple[np.ndarray, np.ndarray, int]:
-    size = path.stat().st_size
-    with path.open("rb") as fh:
-        _header = fh.read(80)
-        count_bytes = fh.read(4)
-    if len(count_bytes) != 4:
-        raise ValueError(f"{path.name} is too small to be an STL file")
-
-    binary_count = struct.unpack("<I", count_bytes)[0]
-    looks_binary = 84 + binary_count * 50 == size
-    if looks_binary:
-        dtype = np.dtype(
-            [
-                ("normal", "<f4", (3,)),
-                ("vertices", "<f4", (3, 3)),
-                ("attr", "<u2"),
-            ]
-        )
-        records = np.memmap(path, dtype=dtype, mode="r", offset=84, shape=(binary_count,))
-        vertices = records["vertices"].reshape(-1, 3)
-        bounds_min = np.asarray(vertices.min(axis=0), dtype=float)
-        bounds_max = np.asarray(vertices.max(axis=0), dtype=float)
-        del records
-        return bounds_min, bounds_max, int(binary_count)
-
-    bounds_min = np.array([math.inf, math.inf, math.inf])
-    bounds_max = np.array([-math.inf, -math.inf, -math.inf])
-    vertex_count = 0
-    with path.open("r", encoding="utf-8", errors="ignore") as fh:
-        for line in fh:
-            stripped = line.strip()
-            if not stripped.startswith("vertex"):
-                continue
-            _tag, x, y, z = stripped.split()[:4]
-            vertex = np.array([float(x), float(y), float(z)], dtype=float)
-            bounds_min = np.minimum(bounds_min, vertex)
-            bounds_max = np.maximum(bounds_max, vertex)
-            vertex_count += 1
-    if vertex_count < 3:
-        raise ValueError(f"{path.name} does not contain STL vertices")
-    return bounds_min, bounds_max, vertex_count // 3
 
 def load_urdf_model(path: Path) -> URDFModel:
     tree = ET.parse(path)
@@ -681,9 +638,7 @@ class RobotViewApp:
         body_origin = np.array([self.state.x, self.state.y, 0.0])
         root_R = body_R @ rot_z(math.radians(90.0))
         joint_angles = self._urdf_joint_angles()
-        root_R = self._support_aligned_root_rotation(root_R, scale, joint_angles)
-        root_origin = self._support_anchored_root(body_origin, root_R, scale, joint_angles)
-        transforms = self._urdf_link_transforms(root_origin, root_R, scale, joint_angles)
+        transforms = self._urdf_supported_link_transforms(body_origin, root_R, scale, joint_angles)
 
         if str(self.vars["render_style"].get()) == "Linkage":
             self._draw_linkage_diagram(transforms, scale)
