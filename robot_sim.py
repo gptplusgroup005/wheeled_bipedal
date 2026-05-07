@@ -12,6 +12,7 @@ import matplotlib
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from fivebar_solver import compute_link_transforms, compute_supported_link_transforms, load_stl_bounds, make_step, make_tree_step, solve_passive_pair, solver_status
@@ -318,6 +319,9 @@ class RobotViewApp:
         self.balance_tilt_deg = 0.0
         self.balance_roll_deg = 0.0
         self.balance_pitch_deg = 0.0
+        self.camera_drag_start: tuple[float, float, float, float, float] | None = None
+        self.selected_item = ""
+        self.selectable_points: dict[str, np.ndarray] = {}
         
         self.vars: dict[str, tk.Variable] = {}
         self._build_vars()
@@ -442,6 +446,8 @@ class RobotViewApp:
         toolbar = NavigationToolbar2Tk(self.canvas, view_frame, pack_toolbar=False)
         toolbar.update()
         toolbar.grid(row=1, column=0, sticky="ew")
+        self.toolbar = toolbar
+        self._configure_solidworks_navigation()
 
         side_container = ttk.Frame(self.root, style="Panel.TFrame", padding=0)
         side_container.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=10)
@@ -535,6 +541,84 @@ class RobotViewApp:
         for child in widget.winfo_children():
             self._bind_mousewheel_recursive(child, callback)
 
+    def _configure_solidworks_navigation(self) -> None:
+        try:
+            self.ax.disable_mouse_rotation()
+        except AttributeError:
+            self.ax.mouse_init(rotate_btn=[], pan_btn=[], zoom_btn=[])
+        self.canvas.mpl_connect("scroll_event", self._on_canvas_scroll)
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_button_press)
+        self.canvas.mpl_connect("button_release_event", self._on_canvas_button_release)
+        self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
+
+    def _on_canvas_scroll(self, event) -> None:
+        if event.inaxes is not self.ax:
+            return
+        step = getattr(event, "step", 0.0)
+        if step == 0:
+            return
+        current = float(self.vars["view_span"].get())
+        factor = 0.90 ** abs(step) if step > 0 else (1.0 / 0.90) ** abs(step)
+        self.vars["view_span"].set(float(np.clip(current * factor, 0.35, 30.0)))
+        self._apply_camera_limits_from_current_center()
+        self.canvas.draw_idle()
+
+    def _on_canvas_button_press(self, event) -> None:
+        if event.inaxes is not self.ax:
+            return
+        if getattr(event, "button", None) == 2:
+            self._remember_camera()
+            elev, azim, roll = self.camera_view or (24.0, -45.0, 0.0)
+            self.camera_drag_start = (float(event.x), float(event.y), elev, azim, roll)
+            return
+        if getattr(event, "button", None) in (1, 3):
+            self._select_nearest_item(event)
+
+    def _on_canvas_button_release(self, event) -> None:
+        if getattr(event, "button", None) == 2:
+            self.camera_drag_start = None
+
+    def _on_canvas_motion(self, event) -> None:
+        if self.camera_drag_start is None or event.inaxes is not self.ax:
+            return
+        start_x, start_y, start_elev, start_azim, start_roll = self.camera_drag_start
+        dx = float(event.x) - start_x
+        dy = float(event.y) - start_y
+        elev = float(np.clip(start_elev - dy * 0.35, -89.0, 89.0))
+        azim = start_azim - dx * 0.35
+        self.camera_view = (elev, azim, start_roll)
+        try:
+            self.ax.view_init(elev=elev, azim=azim, roll=start_roll)
+        except TypeError:
+            self.ax.view_init(elev=elev, azim=azim)
+        self.canvas.draw_idle()
+
+    def _apply_camera_limits_from_current_center(self) -> None:
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        zlim = self.ax.get_zlim()
+        self._apply_camera_limits(
+            center_x=(float(xlim[0]) + float(xlim[1])) * 0.5,
+            center_y=(float(ylim[0]) + float(ylim[1])) * 0.5,
+            center_z=(float(zlim[0]) + float(zlim[1])) * 0.5,
+        )
+
+    def _select_nearest_item(self, event) -> None:
+        if not self.selectable_points:
+            return
+        projected: list[tuple[float, str]] = []
+        for name, point in self.selectable_points.items():
+            x2, y2, _z2 = proj3d.proj_transform(point[0], point[1], point[2], self.ax.get_proj())
+            screen_x, screen_y = self.ax.transData.transform((x2, y2))
+            distance = math.hypot(float(event.x) - screen_x, float(event.y) - screen_y)
+            projected.append((distance, name))
+        distance, name = min(projected, default=(math.inf, ""))
+        if distance > 42.0:
+            return
+        self.selected_item = name
+        self._update_text()
+        self.draw_scene(reset_camera=False)
+
     def _slider(self, parent: ttk.Frame, row: int, label: str, key: str, start: float, end: float, step: float) -> int:
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.grid(row=row, column=0, sticky="ew", pady=2)
@@ -621,6 +705,7 @@ class RobotViewApp:
         root_R = body_R @ rot_z(math.radians(90.0))
         joint_angles = self._urdf_joint_angles()
         transforms = self._urdf_supported_link_transforms(body_origin, root_R, scale, joint_angles)
+        self._cache_selectable_points(transforms)
         self._update_end_effector_positions(transforms)
 
         if str(self.vars["render_style"].get()) == "Linkage":
@@ -640,6 +725,35 @@ class RobotViewApp:
             points = np.asarray([value[0] for name, value in transforms.items() if name != self.urdf.root_link])
             if len(points):
                 self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=18, color="#1d4ed8", edgecolors="#ffffff", linewidths=0.45, depthshade=False)
+        self._draw_selected_marker(scale)
+
+    def _cache_selectable_points(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
+        self.selectable_points = {
+            name: origin.copy()
+            for name, (origin, _rotation) in transforms.items()
+            if self.urdf is None or name != self.urdf.root_link
+        }
+        if self.selected_item and self.selected_item not in self.selectable_points:
+            self.selected_item = ""
+
+    def _draw_selected_marker(self, scale: float) -> None:
+        if not self.selected_item:
+            return
+        point = self.selectable_points.get(self.selected_item)
+        if point is None:
+            return
+        size = max(90.0, 18.0 * scale)
+        self.ax.scatter(
+            [point[0]],
+            [point[1]],
+            [point[2]],
+            s=size,
+            color="#f59e0b",
+            edgecolors="#111827",
+            linewidths=1.1,
+            depthshade=False,
+        )
+        self.ax.text(point[0], point[1], point[2] + 0.045 * scale, self.selected_item, color="#92400e", fontsize=8, ha="center")
 
     def _update_end_effector_positions(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
         self.end_effector_positions = {
@@ -749,6 +863,7 @@ class RobotViewApp:
             all_points = np.asarray([value[0] for name, value in transforms.items() if name != self.urdf.root_link])
             if len(all_points):
                 self.ax.scatter(all_points[:, 0], all_points[:, 1], all_points[:, 2], s=8, color="#9ca3af", depthshade=False, alpha=0.55)
+        self._draw_selected_marker(scale)
 
     def _draw_balance_plane(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> None:
         anchors = [
@@ -1154,18 +1269,7 @@ class RobotViewApp:
         self.camera_view = (float(elev), float(azim), float(roll))
 
     def _set_camera(self, reset_camera: bool = False) -> None:
-        view_span = float(self.vars["view_span"].get())
-        center_x, center_y = self.state.x, self.state.y
-        span = max(view_span, 2.4)
-        self.ax.set_xlim(center_x - span, center_x + span)
-        self.ax.set_ylim(center_y - span, center_y + span)
-        if self.urdf is not None:
-            urdf_scale = float(self.vars["urdf_scale"].get())
-            top = max(1.2, float(self.urdf.bounds_max[2] - self.urdf.bounds_min[2]) * urdf_scale) + 0.55
-            self.ax.set_zlim(0, max(2.4, top))
-        else:
-            self.ax.set_zlim(0, 3.6)
-        self.ax.set_box_aspect((1, 1, 0.45))
+        self._apply_camera_limits(center_x=self.state.x, center_y=self.state.y)
         self.ax.set_xlabel("X")
         self.ax.set_ylabel("Y")
         self.ax.set_zlabel("Z")
@@ -1189,6 +1293,33 @@ class RobotViewApp:
         except TypeError:
             self.ax.view_init(elev=elev, azim=azim)
 
+    def _apply_camera_limits(
+        self,
+        center_x: float | None = None,
+        center_y: float | None = None,
+        center_z: float | None = None,
+    ) -> None:
+        span = max(float(self.vars["view_span"].get()), 0.35)
+        if center_x is None:
+            center_x = self.state.x
+        if center_y is None:
+            center_y = self.state.y
+        if center_z is None:
+            center_z = self._default_camera_z_center()
+
+        z_half_span = max(span * 0.45, 0.08)
+        self.ax.set_xlim(center_x - span, center_x + span)
+        self.ax.set_ylim(center_y - span, center_y + span)
+        self.ax.set_zlim(center_z - z_half_span, center_z + z_half_span)
+        self.ax.set_box_aspect((1, 1, 0.45))
+
+    def _default_camera_z_center(self) -> float:
+        if self.urdf is None:
+            return 1.8
+        urdf_scale = float(self.vars["urdf_scale"].get())
+        top = max(1.2, float(self.urdf.bounds_max[2] - self.urdf.bounds_min[2]) * urdf_scale) + 0.55
+        return top * 0.5
+
     def _update_text(self) -> None:
         now = time.perf_counter()
         self.last_text_update = now
@@ -1210,6 +1341,7 @@ class RobotViewApp:
             f"Balance tilt: {self.balance_tilt_deg:.2f} deg",
             f"Solver: {solver_status().backend}",
             f"Closure L/R: {self.last_closure_error['left']:.5f} / {self.last_closure_error['right']:.5f} m",
+            f"Selected: {self.selected_item or '-'}",
             f"Passive B1/B2 L: {float(self.vars['left_calf_a_deg'].get()):+.2f} / {float(self.vars['left_calf_b_deg'].get()):+.2f} deg",
             f"Passive B1/B2 R: {float(self.vars['right_calf_a_deg'].get()):+.2f} / {float(self.vars['right_calf_b_deg'].get()):+.2f} deg",
         ]
