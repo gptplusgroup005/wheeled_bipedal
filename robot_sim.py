@@ -557,10 +557,20 @@ class RobotViewApp:
         step = getattr(event, "step", 0.0)
         if step == 0:
             return
-        current = float(self.vars["view_span"].get())
-        factor = 0.90 ** abs(step) if step > 0 else (1.0 / 0.90) ** abs(step)
-        self.vars["view_span"].set(float(np.clip(current * factor, 0.35, 30.0)))
-        self._apply_camera_limits_from_current_center()
+        current_span = max(float(self.vars["view_span"].get()), 0.35)
+        requested_factor = 0.90 ** abs(step) if step > 0 else (1.0 / 0.90) ** abs(step)
+        new_span = float(np.clip(current_span * requested_factor, 0.35, 30.0))
+        actual_factor = new_span / current_span
+
+        current_center = self._current_camera_center()
+        anchor = self._cursor_anchor_point(event, current_center)
+        new_center = anchor + (current_center - anchor) * actual_factor
+        self.vars["view_span"].set(new_span)
+        self._apply_camera_limits(
+            center_x=float(new_center[0]),
+            center_y=float(new_center[1]),
+            center_z=float(new_center[2]),
+        )
         self.canvas.draw_idle()
 
     def _on_canvas_button_press(self, event) -> None:
@@ -594,14 +604,44 @@ class RobotViewApp:
         self.canvas.draw_idle()
 
     def _apply_camera_limits_from_current_center(self) -> None:
+        center = self._current_camera_center()
+        self._apply_camera_limits(center_x=float(center[0]), center_y=float(center[1]), center_z=float(center[2]))
+
+    def _current_camera_center(self) -> np.ndarray:
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
         zlim = self.ax.get_zlim()
-        self._apply_camera_limits(
-            center_x=(float(xlim[0]) + float(xlim[1])) * 0.5,
-            center_y=(float(ylim[0]) + float(ylim[1])) * 0.5,
-            center_z=(float(zlim[0]) + float(zlim[1])) * 0.5,
+        return np.array(
+            [
+                (float(xlim[0]) + float(xlim[1])) * 0.5,
+                (float(ylim[0]) + float(ylim[1])) * 0.5,
+                (float(zlim[0]) + float(zlim[1])) * 0.5,
+            ],
+            dtype=float,
         )
+
+    def _cursor_anchor_point(self, event, fallback: np.ndarray) -> np.ndarray:
+        try:
+            proj_x, proj_y = self.ax.transData.inverted().transform((event.x, event.y))
+            inv_projection = np.linalg.inv(self.ax.get_proj())
+            near = np.asarray(proj3d.inv_transform(proj_x, proj_y, -1.0, inv_projection), dtype=float).reshape(3)
+            far = np.asarray(proj3d.inv_transform(proj_x, proj_y, 1.0, inv_projection), dtype=float).reshape(3)
+        except (ValueError, np.linalg.LinAlgError):
+            return fallback
+
+        ray = far - near
+        ray_norm = float(np.linalg.norm(ray))
+        if ray_norm < 1e-9 or not np.isfinite(ray_norm):
+            return fallback
+        view_normal = ray / ray_norm
+        denom = float(np.dot(ray, view_normal))
+        if abs(denom) < 1e-9:
+            return fallback
+        t = float(np.dot(fallback - near, view_normal) / denom)
+        anchor = near + ray * t
+        if not np.isfinite(anchor).all():
+            return fallback
+        return anchor
 
     def _select_nearest_item(self, event) -> None:
         if not self.selectable_points:
@@ -625,11 +665,14 @@ class RobotViewApp:
         frame.columnconfigure(0, weight=1)
         ttk.Label(frame, text=label).grid(row=0, column=0, sticky="w")
         value = ttk.Label(frame, textvariable=self.vars[key], width=7, anchor="e")
-        value.grid(row=0, column=1, sticky="e")
+        value.grid(row=0, column=1, columnspan=2, sticky="e")
         scale = ttk.Scale(frame, from_=start, to=end, variable=self.vars[key], command=lambda _v: self.queue_draw(changed_key=key))
-        scale.grid(row=1, column=0, columnspan=2, sticky="ew")
+        scale.grid(row=1, column=0, columnspan=3, sticky="ew")
         spin = ttk.Spinbox(frame, from_=start, to=end, increment=step, textvariable=self.vars[key], width=8, command=lambda: self.queue_draw(changed_key=key))
         spin.grid(row=2, column=1, sticky="e", pady=(2, 0))
+        spin.bind("<Return>", lambda _event: self.queue_draw(changed_key=key))
+        spin.bind("<KP_Enter>", lambda _event: self.queue_draw(changed_key=key))
+        ttk.Button(frame, text="Apply", command=lambda: self.queue_draw(changed_key=key)).grid(row=2, column=2, sticky="e", padx=(6, 0), pady=(2, 0))
         return row + 1
 
     def reset(self) -> None:
