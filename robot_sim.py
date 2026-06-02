@@ -297,7 +297,7 @@ def load_urdf_model(path: Path) -> URDFModel:
 class RobotViewApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Bao 2-Legged Robot 3D View")
+        self.root.title("UI")
         self.root.geometry("1360x840")
         self.root.minsize(1120, 720)
 
@@ -487,7 +487,7 @@ class RobotViewApp:
         buttons = ttk.Frame(side, style="Panel.TFrame")
         buttons.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         buttons.columnconfigure(0, weight=1)
-        ttk.Button(buttons, text="Reset angles", command=self.reset).grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+        ttk.Button(buttons, text="Reset angles", command=self.reset_angles).grid(row=0, column=0, sticky="ew", padx=2, pady=2)
         row += 1
 
         row = self._section(side, row, "Left Active Joints")
@@ -518,6 +518,8 @@ class RobotViewApp:
         camera = ttk.Combobox(side, textvariable=self.vars["camera"], values=("ISO", "Front", "Side", "Top"), state="readonly")
         camera.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         camera.bind("<<ComboboxSelected>>", lambda _event: self.draw_scene(reset_camera=True))
+        row += 1
+        ttk.Button(side, text="Reset camera", command=self.reset_camera).grid(row=row, column=0, sticky="ew", pady=4)
         row += 1
         ttk.Button(side, text="Snapshot redraw", command=lambda: self.draw_scene(reset_camera=False)).grid(row=row, column=0, sticky="ew", pady=4)
         row += 1
@@ -675,7 +677,7 @@ class RobotViewApp:
         ttk.Button(frame, text="Apply", command=lambda: self.queue_draw(changed_key=key)).grid(row=2, column=2, sticky="e", padx=(6, 0), pady=(2, 0))
         return row + 1
 
-    def reset(self) -> None:
+    def reset_angles(self) -> None:
         self.state = RobotState()
         for key in (
             "left_thigh_a_deg",
@@ -689,6 +691,9 @@ class RobotViewApp:
         ):
             self.vars[key].set(0.0)
         self.solve_dirty_sides = {"left", "right"}
+        self.draw_scene(reset_camera=False)
+
+    def reset_camera(self) -> None:
         self.draw_scene(reset_camera=True)
 
     def body_rotation(self) -> np.ndarray:
@@ -1321,9 +1326,9 @@ class RobotViewApp:
         if reset_camera or not self.camera_initialized or self.camera_view is None:
             camera = str(self.vars["camera"].get())
             if camera == "Front":
-                self.camera_view = (8.0, -90.0, 0.0)
+                self.camera_view = (0.0, 0.0, 0.0)
             elif camera == "Side":
-                self.camera_view = (12.0, 0.0, 0.0)
+                self.camera_view = (0.0, -90.0, 0.0)
             elif camera == "Top":
                 self.camera_view = (89.0, -90.0, 0.0)
             else:
