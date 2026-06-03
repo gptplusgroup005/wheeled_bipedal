@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bao Robot Viewer</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="viewport">
+        <canvas id="scene"></canvas>
+        <canvas id="triad" width="150" height="110"></canvas>
+        <div id="status" class="status">Starting...</div>
+      </section>
+
+      <aside class="panel">
+        <header class="panel-header">
+          <h1>Bao Robot Viewer</h1>
+          <button id="resetAngles" type="button">Reset angles</button>
+        </header>
+
+        <section class="group">
+          <h2>Left Active Joints</h2>
+          <label class="slider-row">
+            <span>A1 active deg</span>
+            <output id="left_thigh_a_deg_out">0.0</output>
+            <input id="left_thigh_a_deg" type="range" min="-90" max="90" step="0.1" value="0">
+            <input id="left_thigh_a_deg_num" type="number" min="-90" max="90" step="0.1" value="0">
+          </label>
+          <label class="slider-row">
+            <span>A2 active deg</span>
+            <output id="left_thigh_b_deg_out">0.0</output>
+            <input id="left_thigh_b_deg" type="range" min="-90" max="90" step="0.1" value="0">
+            <input id="left_thigh_b_deg_num" type="number" min="-90" max="90" step="0.1" value="0">
+          </label>
+        </section>
+
+        <section class="group">
+          <h2>Right Active Joints</h2>
+          <label class="slider-row">
+            <span>A1 active deg</span>
+            <output id="right_thigh_a_deg_out">0.0</output>
+            <input id="right_thigh_a_deg" type="range" min="-90" max="90" step="0.1" value="0">
+            <input id="right_thigh_a_deg_num" type="number" min="-90" max="90" step="0.1" value="0">
+          </label>
+          <label class="slider-row">
+            <span>A2 active deg</span>
+            <output id="right_thigh_b_deg_out">0.0</output>
+            <input id="right_thigh_b_deg" type="range" min="-90" max="90" step="0.1" value="0">
+            <input id="right_thigh_b_deg_num" type="number" min="-90" max="90" step="0.1" value="0">
+          </label>
+        </section>
+
+        <section class="group">
+          <h2>Camera</h2>
+          <div class="control-row">
+            <select id="cameraMode">
+              <option value="ISO">ISO</option>
+              <option value="Front">Front</option>
+              <option value="Side">Side</option>
+              <option value="Top">Top</option>
+            </select>
+            <button id="resetCamera" type="button">Reset</button>
+          </div>
+          <button id="redraw" type="button">Redraw</button>
+        </section>
+
+        <section class="telemetry group">
+          <h2>Telemetry</h2>
+          <pre id="telemetry">Waiting for robot data...</pre>
+        </section>
+      </aside>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

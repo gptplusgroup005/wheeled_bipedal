@@ -34,15 +34,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/base_link.obj" />
-      </geometry>
-    </collision>
   </link>
   <link
     name="pad_link_right">
@@ -74,15 +65,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/pad_link_right.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="pad_joint_right"
@@ -132,15 +114,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/hip_frame_link_right.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="hip_frame_joint_right"
@@ -185,15 +158,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/thigh_right_1.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="thigh_joint_right_1"
@@ -239,15 +203,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/calf_right_link_1.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="calf_joint_right_1"
@@ -293,15 +248,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/wheel_link_right.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="wheel_joint_right"
@@ -346,15 +292,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/thigh_right_2.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="thigh_joint_right_2"
@@ -400,15 +337,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/calf_right_link_2.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="calf_joint_right_2"
@@ -454,15 +382,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/pad_link_left.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="pad_joint_left"
@@ -512,15 +431,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/hip_frame_link_left.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="hip_frame_joint_left"
@@ -565,15 +475,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/thigh_left_1.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="thigh_joint_left_1"
@@ -619,15 +520,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/calf_left_link_1.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="calf_joint_left_1"
@@ -673,15 +565,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/wheel_link_left.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="wheel_joint_left"
@@ -726,15 +609,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/thigh_left_2.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="thigh_joint_left_2"
@@ -780,15 +654,6 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0" />
-      <geometry>
-        <mesh
-          filename="../meshes/collision/calf_left_link_2.obj" />
-      </geometry>
-    </collision>
   </link>
   <joint
     name="calf_joint_left_2"

@@ -207,6 +207,24 @@ def solve_passive_pair(
     return float(out[0]), float(out[1]), float(out[2])
 
 
+def compute_balance_plane(anchors: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray, float, float, float] | None:
+    anchors = np.ascontiguousarray(np.asarray(anchors, dtype=np.float64).reshape(4, 3))
+    out = np.zeros(18, dtype=np.float64)
+
+    lib = _load_c_solver()
+    if lib is None:
+        raise RuntimeError(f"C backend is required for balance plane solve: {_STATUS.message}")
+
+    ok = lib.compute_balance_plane_c(
+        anchors.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.c_double(scale),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+    )
+    if not ok:
+        return None
+    return out[:12].reshape(4, 3), out[12:15].copy(), float(out[15]), float(out[16]), float(out[17])
+
+
 def _as_chain(chain: np.ndarray) -> np.ndarray:
     arr = np.asarray(chain, dtype=np.float64)
     if arr.size == 0:
@@ -298,6 +316,12 @@ def _load_c_solver() -> ctypes.CDLL | None:
             ctypes.POINTER(ctypes.c_int),
         ]
         lib.load_stl_bounds_c.restype = ctypes.c_int
+        lib.compute_balance_plane_c.argtypes = [
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_double,
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        lib.compute_balance_plane_c.restype = ctypes.c_int
         _LIB = lib
         _STATUS = SolverStatus("C", str(library))
         return _LIB

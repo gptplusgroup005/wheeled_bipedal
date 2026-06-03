@@ -92,6 +92,16 @@ static double vec_norm(const double v[3]) {
     return sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
+static double vec_dot(const double a[3], const double b[3]) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void vec_cross(const double a[3], const double b[3], double out[3]) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
 static void rotation_between_vectors(const double from_in[3], const double to_in[3], double out[9]) {
     double from[3] = {from_in[0], from_in[1], from_in[2]};
     double to[3] = {to_in[0], to_in[1], to_in[2]};
@@ -371,6 +381,99 @@ int solve_passive_pair_c(
     out[1] = best_b;
     out[2] = best_error;
     return isfinite(best_error) ? 1 : 0;
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int compute_balance_plane_c(
+    const double *anchors,
+    double scale,
+    double *out
+) {
+    if (!anchors || !out) {
+        return 0;
+    }
+
+    const double *right_1 = anchors;
+    const double *right_2 = anchors + 3;
+    const double *left_1 = anchors + 6;
+    const double *left_2 = anchors + 9;
+
+    double right_center[3] = {
+        (right_1[0] + right_2[0]) * 0.5,
+        (right_1[1] + right_2[1]) * 0.5,
+        (right_1[2] + right_2[2]) * 0.5,
+    };
+    double left_center[3] = {
+        (left_1[0] + left_2[0]) * 0.5,
+        (left_1[1] + left_2[1]) * 0.5,
+        (left_1[2] + left_2[2]) * 0.5,
+    };
+    double x_axis[3] = {
+        ((right_2[0] - right_1[0]) + (left_2[0] - left_1[0])) * 0.5,
+        ((right_2[1] - right_1[1]) + (left_2[1] - left_1[1])) * 0.5,
+        ((right_2[2] - right_1[2]) + (left_2[2] - left_1[2])) * 0.5,
+    };
+    double y_axis[3] = {
+        left_center[0] - right_center[0],
+        left_center[1] - right_center[1],
+        left_center[2] - right_center[2],
+    };
+
+    double x_norm = vec_norm(x_axis);
+    double y_norm = vec_norm(y_axis);
+    if (x_norm < 1e-9 || y_norm < 1e-9) {
+        return 0;
+    }
+    for (int i = 0; i < 3; ++i) {
+        x_axis[i] /= x_norm;
+        y_axis[i] /= y_norm;
+    }
+
+    double normal[3];
+    vec_cross(x_axis, y_axis, normal);
+    double normal_norm = vec_norm(normal);
+    if (normal_norm < 1e-9) {
+        return 0;
+    }
+    for (int i = 0; i < 3; ++i) {
+        normal[i] /= normal_norm;
+    }
+    if (normal[2] < 0.0) {
+        for (int i = 0; i < 3; ++i) {
+            normal[i] = -normal[i];
+            y_axis[i] = -y_axis[i];
+        }
+    }
+    vec_cross(normal, x_axis, y_axis);
+
+    double center[3] = {
+        (right_1[0] + right_2[0] + left_1[0] + left_2[0]) * 0.25 + normal[0] * (0.018 * scale),
+        (right_1[1] + right_2[1] + left_1[1] + left_2[1]) * 0.25 + normal[1] * (0.018 * scale),
+        (right_1[2] + right_2[2] + left_1[2] + left_2[2]) * 0.25 + normal[2] * (0.018 * scale),
+    };
+    double half_x = fmax(x_norm * 0.95, 0.14 * scale);
+    double half_y = fmax(y_norm * 0.72, 0.10 * scale);
+    double signs[4][2] = {{-1.0, -1.0}, {1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}};
+    for (int corner = 0; corner < 4; ++corner) {
+        for (int axis = 0; axis < 3; ++axis) {
+            out[corner * 3 + axis] =
+                center[axis] +
+                x_axis[axis] * half_x * signs[corner][0] +
+                y_axis[axis] * half_y * signs[corner][1];
+        }
+    }
+    out[12] = center[0];
+    out[13] = center[1];
+    out[14] = center[2];
+    out[15] = atan2(-normal[0], sqrt(normal[1] * normal[1] + normal[2] * normal[2])) * 180.0 / M_PI;
+    out[16] = atan2(normal[1], normal[2]) * 180.0 / M_PI;
+    double up_dot = normal[2];
+    if (up_dot < -1.0) up_dot = -1.0;
+    if (up_dot > 1.0) up_dot = 1.0;
+    out[17] = acos(up_dot) * 180.0 / M_PI;
+    return isfinite(out[17]) ? 1 : 0;
 }
 
 #ifdef _WIN32
