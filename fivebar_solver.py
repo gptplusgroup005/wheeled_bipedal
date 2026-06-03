@@ -8,26 +8,21 @@ from pathlib import Path
 
 import numpy as np
 
-
 STEP_WIDTH = 16
 TREE_STEP_WIDTH = 13
-
 
 @dataclass(frozen=True)
 class SolverStatus:
     backend: str
     message: str
 
-
 _STATUS = SolverStatus("unavailable", "C solver not loaded")
 _LIB: ctypes.CDLL | None = None
 _LOAD_ATTEMPTED = False
 
-
 def solver_status() -> SolverStatus:
     _load_c_solver()
     return _STATUS
-
 
 def make_step(origin_xyz: np.ndarray, origin_rotation: np.ndarray, axis: np.ndarray, angle_index: int) -> np.ndarray:
     return np.asarray(
@@ -43,7 +38,6 @@ def make_step(origin_xyz: np.ndarray, origin_rotation: np.ndarray, axis: np.ndar
         ],
         dtype=np.float64,
     )
-
 
 def make_tree_step(parent_index: int, child_index: int, origin_xyz: np.ndarray, origin_rpy: np.ndarray, axis: np.ndarray, angle_index: int, movable: bool) -> np.ndarray:
     return np.asarray(
@@ -64,7 +58,6 @@ def make_tree_step(parent_index: int, child_index: int, origin_xyz: np.ndarray, 
         ],
         dtype=np.float64,
     )
-
 
 def compute_link_transforms(
     tree_steps: np.ndarray,
@@ -100,7 +93,6 @@ def compute_link_transforms(
     if not ok:
         raise RuntimeError("C backend failed to compute FK transforms")
     return origins, rotations
-
 
 def compute_supported_link_transforms(
     tree_steps: np.ndarray,
@@ -143,7 +135,6 @@ def compute_supported_link_transforms(
         raise RuntimeError("C backend failed to compute supported FK transforms")
     return origins, rotations
 
-
 def load_stl_bounds(path: Path | str) -> tuple[np.ndarray, np.ndarray, int]:
     path = Path(path)
     lib = _load_c_solver()
@@ -162,7 +153,6 @@ def load_stl_bounds(path: Path | str) -> tuple[np.ndarray, np.ndarray, int]:
     if not ok:
         raise RuntimeError(f"C backend failed to read STL bounds: {path.name}")
     return bounds_min, bounds_max, int(triangle_count.value)
-
 
 def solve_passive_pair(
     wheel_chain: np.ndarray,
@@ -206,7 +196,6 @@ def solve_passive_pair(
         raise RuntimeError("C backend failed to solve the passive five-bar pair")
     return float(out[0]), float(out[1]), float(out[2])
 
-
 def compute_balance_plane(anchors: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray, float, float, float] | None:
     anchors = np.ascontiguousarray(np.asarray(anchors, dtype=np.float64).reshape(4, 3))
     out = np.zeros(18, dtype=np.float64)
@@ -224,20 +213,17 @@ def compute_balance_plane(anchors: np.ndarray, scale: float) -> tuple[np.ndarray
         return None
     return out[:12].reshape(4, 3), out[12:15].copy(), float(out[15]), float(out[16]), float(out[17])
 
-
 def _as_chain(chain: np.ndarray) -> np.ndarray:
     arr = np.asarray(chain, dtype=np.float64)
     if arr.size == 0:
         return np.empty((0, STEP_WIDTH), dtype=np.float64)
     return np.ascontiguousarray(arr.reshape(-1, STEP_WIDTH), dtype=np.float64)
 
-
 def _as_tree_steps(steps: np.ndarray) -> np.ndarray:
     arr = np.asarray(steps, dtype=np.float64)
     if arr.size == 0:
         return np.empty((0, TREE_STEP_WIDTH), dtype=np.float64)
     return np.ascontiguousarray(arr.reshape(-1, TREE_STEP_WIDTH), dtype=np.float64)
-
 
 def _load_c_solver() -> ctypes.CDLL | None:
     global _LIB, _STATUS, _LOAD_ATTEMPTED
@@ -329,7 +315,6 @@ def _load_c_solver() -> ctypes.CDLL | None:
         _STATUS = SolverStatus("unavailable", f"C solver load failed: {exc}")
         return None
 
-
 def _compile_c_solver(source: Path, library: Path) -> None:
     global _STATUS
     library.parent.mkdir(exist_ok=True)
@@ -375,17 +360,14 @@ def _compile_c_solver(source: Path, library: Path) -> None:
         last_error = (result.stderr or result.stdout).strip()
     _STATUS = SolverStatus("unavailable", f"C compiler unavailable: {last_error}")
 
-
 def _is_windows() -> bool:
     return hasattr(ctypes, "WinDLL")
-
 
 def _library_for_source(source: Path, build_dir: Path) -> Path:
     version = source.stat().st_mtime_ns
     if _is_windows():
         return build_dir / f"fivebar_solver_{version}.dll"
     return build_dir / f"libfivebar_solver_{version}.so"
-
 
 def _msvc_build_command(source: Path, library: Path) -> str | None:
     candidates = [
