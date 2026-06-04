@@ -15,15 +15,15 @@ const jointKeys = [
 
 const cameraPresets = {
   ISO: { elev: 30, azim: 135, roll: 0, span: 1.35 },
-  Front: { elev: 90, azim: 0, roll: 0, span: 1.35 },
-  Side: { elev: 90, azim: -90, roll: 0, span: 1.35 },
+  Front: { elev: 90, azim: -90, roll: 0, span: 1.35 },
+  Side: { elev: 90, azim: 0, roll: 0, span: 1.35 },
   Top: { elev: 0, azim: 0, roll: 0, span: 1.35 },
 };
 
 const colors = {
   sceneBg: "#0d1117",
   grid: "#21262d",
-  balanceFill: "rgba(56, 139, 253, 0.22)",
+  balanceFill: "rgba(56, 139, 253, 0.15)",
   balanceStroke: "#58a6ff",
   balanceText: "#79c0ff",
   pointStroke: "#0d1117",
@@ -34,6 +34,9 @@ const colors = {
 let scene = null;
 let camera = { mode: "ISO", ...cameraPresets.ISO };
 let dragging = null;
+let framePending = false;
+let updateInFlight = false;
+let pendingAngleValues = {};
 
 function degToRad(value) {
   return (value * Math.PI) / 180;
@@ -55,45 +58,78 @@ function rotatePoint(point, cam = camera) {
   return [x1, y2, z2];
 }
 
-function project(point, width, height, center, span, cam = camera) {
-  const shifted = [point[0] - center[0], point[1] - center[1], point[2] - center[2]];
-  const rotated = rotatePoint(shifted, cam);
+function makeProjector(width, height, center, span, cam = camera) {
+  const az = degToRad(cam.azim);
+  const el = degToRad(cam.elev);
+  const ca = Math.cos(-az);
+  const sa = Math.sin(-az);
+  const ce = Math.cos(-el);
+  const se = Math.sin(-el);
   const scale = Math.min(width, height) / (span * 2);
-  return {
-    x: width * 0.5 + rotated[0] * scale,
-    y: height * 0.5 - rotated[1] * scale,
-    z: rotated[2],
+  return (point) => {
+    const x0 = point[0] - center[0];
+    const y0 = point[1] - center[1];
+    const z0 = point[2] - center[2];
+    const x1 = ca * x0 - sa * y0;
+    const y1 = sa * x0 + ca * y0;
+    const y2 = ce * y1 - se * z0;
+    const z2 = se * y1 + ce * z0;
+    return {
+      x: width * 0.5 + x1 * scale,
+      y: height * 0.5 - y2 * scale,
+      z: z2,
+    };
   };
 }
 
-function collectPoints(linkage) {
-  const points = [];
-  for (const line of linkage.grid) points.push(line.a, line.b);
-  for (const line of linkage.lines) points.push(line.a, line.b);
-  for (const point of linkage.points) points.push(point.p);
-  for (const wheel of linkage.wheels) points.push(wheel.center);
-  if (linkage.balance) points.push(...linkage.balance.corners, linkage.balance.center);
-  return points;
-}
-
 function sceneCenter(linkage) {
-  const points = collectPoints(linkage);
-  if (!points.length) return [0, 0, 0.6];
-  const sum = points.reduce((acc, point) => [acc[0] + point[0], acc[1] + point[1], acc[2] + point[2]], [0, 0, 0]);
-  return sum.map((value) => value / points.length);
+  let sx = 0;
+  let sy = 0;
+  let sz = 0;
+  let count = 0;
+  const add = (point) => {
+    sx += point[0];
+    sy += point[1];
+    sz += point[2];
+    count += 1;
+  };
+  for (const line of linkage.grid) {
+    add(line.a);
+    add(line.b);
+  }
+  for (const line of linkage.lines) {
+    add(line.a);
+    add(line.b);
+  }
+  for (const point of linkage.points) add(point.p);
+  for (const wheel of linkage.wheels) {
+    add(wheel.center);
+    if (wheel.contact) add(wheel.contact);
+  }
+  if (linkage.balance) {
+    for (const corner of linkage.balance.corners) add(corner);
+    add(linkage.balance.center);
+  }
+  return count ? [sx / count, sy / count, sz / count] : [0, 0, 0.6];
 }
 
 function resizeCanvas(canvas) {
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.max(1, Math.round(rect.width * dpr));
-  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  const width = Math.max(1, Math.round(rect.width * dpr));
+  const height = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return rect;
 }
 
 function drawLine(ctx, a, b, style) {
+  ctx.save();
+  ctx.globalAlpha = style.alpha ?? 1;
   ctx.strokeStyle = style.color;
   ctx.lineWidth = style.width;
   ctx.lineCap = "round";
@@ -101,9 +137,100 @@ function drawLine(ctx, a, b, style) {
   ctx.moveTo(a.x, a.y);
   ctx.lineTo(b.x, b.y);
   ctx.stroke();
+  ctx.restore();
+}
+
+function wheelPoint(wheel, cosValue, sinValue, axialOffset = 0) {
+  const r = wheel.radius;
+  return [
+    wheel.center[0] + wheel.axisX[0] * cosValue * r + wheel.axisZ[0] * sinValue * r + wheel.axisY[0] * axialOffset,
+    wheel.center[1] + wheel.axisX[1] * cosValue * r + wheel.axisZ[1] * sinValue * r + wheel.axisY[1] * axialOffset,
+    wheel.center[2] + wheel.axisX[2] * cosValue * r + wheel.axisZ[2] * sinValue * r + wheel.axisY[2] * axialOffset,
+  ];
+}
+
+function drawProjectedRing(ctx, wheel, projected, axialOffset, color, width, alpha = 1) {
+  const segments = 44;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  for (let i = 0; i <= segments; i += 1) {
+    const t = (i / segments) * Math.PI * 2;
+    const p = projected(wheelPoint(wheel, Math.cos(t), Math.sin(t), axialOffset));
+    if (i === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawWheel(ctx, wheel, projected) {
+  if (!wheel.axisX || !wheel.axisY || !wheel.axisZ) {
+    const p = projected(wheel.center);
+    ctx.strokeStyle = wheel.color;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 14, 0, Math.PI * 2);
+    ctx.stroke();
+    return;
+  }
+
+  const halfWidth = wheel.halfWidth || 0;
+  const backOffset = -halfWidth;
+  const frontOffset = halfWidth;
+  drawProjectedRing(ctx, wheel, projected, backOffset, "#6e7681", 2, 0.65);
+  drawProjectedRing(ctx, wheel, projected, frontOffset, wheel.color, 4, 1);
+
+  for (const angle of [0, Math.PI * 0.5, Math.PI, Math.PI * 1.5]) {
+    drawLine(
+      ctx,
+      projected(wheelPoint(wheel, Math.cos(angle), Math.sin(angle), frontOffset)),
+      projected(wheel.center),
+      { color: "#8b949e", width: 1.5 },
+    );
+  }
+
+  drawLine(
+    ctx,
+    projected([
+      wheel.center[0] - wheel.axisY[0] * halfWidth,
+      wheel.center[1] - wheel.axisY[1] * halfWidth,
+      wheel.center[2] - wheel.axisY[2] * halfWidth,
+    ]),
+    projected([
+      wheel.center[0] + wheel.axisY[0] * halfWidth,
+      wheel.center[1] + wheel.axisY[1] * halfWidth,
+      wheel.center[2] + wheel.axisY[2] * halfWidth,
+    ]),
+    { color: "#c9d1d9", width: 2 },
+  );
+
+  if (wheel.contact) {
+    const contact = projected(wheel.contact);
+    ctx.fillStyle = "#d29922";
+    ctx.strokeStyle = "#0d1117";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(contact.x, contact.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
 }
 
 function drawScene() {
+  if (framePending) return;
+  framePending = true;
+  requestAnimationFrame(() => {
+    framePending = false;
+    drawSceneNow();
+  });
+}
+
+function drawSceneNow() {
   const rect = resizeCanvas(sceneCanvas);
   sceneCtx.clearRect(0, 0, rect.width, rect.height);
   sceneCtx.fillStyle = colors.sceneBg;
@@ -113,7 +240,7 @@ function drawScene() {
   const linkage = scene.linkage;
   const center = sceneCenter(linkage);
   const span = camera.span;
-  const projected = (point) => project(point, rect.width, rect.height, center, span);
+  const projected = makeProjector(rect.width, rect.height, center, span);
 
   for (const line of linkage.grid) {
     drawLine(sceneCtx, projected(line.a), projected(line.b), { color: colors.grid, width: 1 });
@@ -146,13 +273,7 @@ function drawScene() {
   }
 
   for (const wheel of linkage.wheels) {
-    const p = projected(wheel.center);
-    const radius = Math.max(14, (wheel.radius * Math.min(rect.width, rect.height)) / (span * 2));
-    sceneCtx.strokeStyle = wheel.color;
-    sceneCtx.lineWidth = 4;
-    sceneCtx.beginPath();
-    sceneCtx.ellipse(p.x, p.y, radius * 0.72, radius, 0, 0, Math.PI * 2);
-    sceneCtx.stroke();
+    drawWheel(sceneCtx, wheel, projected);
   }
 
   for (const point of linkage.points) {
@@ -255,10 +376,24 @@ async function refresh() {
   drawScene();
 }
 
-async function updateJoint(key, value) {
-  scene = await window.pywebview.api.update_angles({ [key]: Number(value) });
-  if (scene.ok) syncAngles(scene.angles);
-  drawScene();
+async function flushAngleUpdates() {
+  if (updateInFlight || !Object.keys(pendingAngleValues).length) return;
+  const values = pendingAngleValues;
+  pendingAngleValues = {};
+  updateInFlight = true;
+  try {
+    scene = await window.pywebview.api.update_angles(values);
+    if (scene.ok) syncAngles(scene.angles);
+    drawScene();
+  } finally {
+    updateInFlight = false;
+    if (Object.keys(pendingAngleValues).length) flushAngleUpdates();
+  }
+}
+
+function updateJoint(key, value) {
+  pendingAngleValues[key] = Number(value);
+  flushAngleUpdates();
 }
 
 function wireControls() {

@@ -35,6 +35,13 @@ JOINT_ANGLE_NAMES = (
 )
 JOINT_ANGLE_INDEX = {name: index for index, name in enumerate(JOINT_ANGLE_NAMES)}
 DEFAULT_CAMERA = {"mode": "ISO", "elev": 30.0, "azim": 135.0, "roll": 0.0, "span": 1.35}
+SCENE_SCALE = 4.0
+ROOT_ROTATION = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+ZERO_VEC3 = np.zeros(3, dtype=np.float64)
+LOOP_OFFSETS = {
+    "right": np.array([-0.18, -0.03, 0.0], dtype=np.float64),
+    "left": np.array([-0.18, 0.03, 0.0], dtype=np.float64),
+}
 
 @dataclass
 class MeshVisual:
@@ -98,6 +105,18 @@ def parse_vec(text: str | None, fallback: tuple[float, float, float] = (0.0, 0.0
 
 def serial_vec(point: Vec3) -> list[float]:
     return [float(point[0]), float(point[1]), float(point[2])]
+
+def serial_axis(rotation: np.ndarray, axis_index: int) -> list[float]:
+    return [float(rotation[0, axis_index]), float(rotation[1, axis_index]), float(rotation[2, axis_index])]
+
+def wheel_contact_point(center: np.ndarray, rotation: np.ndarray, radius: float) -> np.ndarray:
+    plane_x = rotation[:, 0]
+    plane_z = rotation[:, 2]
+    vertical = np.array([plane_x[2], plane_z[2]], dtype=np.float64)
+    vertical_norm = float(np.linalg.norm(vertical))
+    if vertical_norm < 1e-9:
+        return center.copy()
+    return center - radius * ((vertical[0] / vertical_norm) * plane_x + (vertical[1] / vertical_norm) * plane_z)
 
 def load_urdf_model(path: Path) -> URDFModel:
     tree = ET.parse(path)
@@ -183,6 +202,10 @@ class RobotEngine:
         self.link_index: dict[str, int] = {}
         self.tree_steps = np.empty((0, 13), dtype=np.float64)
         self.solver_chains: dict[str, np.ndarray] = {}
+        self.solver_status = solver_status()
+        self.joint_angle_array = np.zeros(len(JOINT_ANGLE_NAMES), dtype=np.float64)
+        self.link_radii: dict[str, float] = {}
+        self.link_half_widths: dict[str, float] = {}
         self.angles_deg = {
             "left_thigh_a_deg": 0.0,
             "left_thigh_b_deg": 0.0,
@@ -205,6 +228,7 @@ class RobotEngine:
         try:
             self.urdf = load_urdf_model(self.urdf_path)
             self._prepare_c_kinematics()
+            self._prepare_static_geometry(SCENE_SCALE)
             self.urdf_error = ""
         except Exception as exc:
             self.urdf = None
@@ -229,18 +253,16 @@ class RobotEngine:
     def scene(self) -> dict:
         if self.urdf is None:
             return {"ok": False, "error": self.urdf_error, "camera": DEFAULT_CAMERA}
-        scale = 4.0
-        root_rotation = rot_z(math.radians(90.0))
         joint_angles = self._joint_angles()
-        transforms = self._supported_link_transforms(np.zeros(3), root_rotation, scale, joint_angles)
+        transforms = self._supported_link_transforms(ZERO_VEC3, ROOT_ROTATION, SCENE_SCALE, joint_angles)
         return {
             "ok": True,
             "camera": DEFAULT_CAMERA,
-            "solver": solver_status().__dict__,
+            "solver": self.solver_status.__dict__,
             "warning": self.backend_warning,
             "angles": self.angles_deg,
             "closure": self.last_closure_error,
-            "linkage": self._linkage_scene(transforms, scale),
+            "linkage": self._linkage_scene(transforms, SCENE_SCALE),
             "meta": {
                 "urdf": self.urdf.name,
                 "root": self.urdf.root_link,
@@ -284,56 +306,66 @@ class RobotEngine:
             for joint in ordered_joints
         ]
         self.tree_steps = np.vstack(steps) if steps else np.empty((0, 13), dtype=np.float64)
+        self.solver_chains.clear()
 
-    def _joint_angles(self) -> dict[str, float]:
-        angles = {
-            "pad_joint_right": 0.0,
-            "thigh_joint_right_1": math.radians(self.angles_deg["right_thigh_a_deg"]),
-            "calf_joint_right_1": math.radians(self.angles_deg["right_calf_a_deg"]),
-            "thigh_joint_right_2": math.radians(self.angles_deg["right_thigh_b_deg"]),
-            "calf_joint_right_2": math.radians(self.angles_deg["right_calf_b_deg"]),
-            "wheel_joint_right": 0.0,
-            "pad_joint_left": 0.0,
-            "thigh_joint_left_1": math.radians(self.angles_deg["left_thigh_a_deg"]),
-            "calf_joint_left_1": math.radians(self.angles_deg["left_calf_a_deg"]),
-            "thigh_joint_left_2": math.radians(self.angles_deg["left_thigh_b_deg"]),
-            "calf_joint_left_2": math.radians(self.angles_deg["left_calf_b_deg"]),
-            "wheel_joint_left": 0.0,
+    def _prepare_static_geometry(self, scale: float) -> None:
+        if self.urdf is None:
+            return
+        self.link_radii = {
+            name: self._compute_link_radius(name, scale, 0.045 * scale)
+            for name in ("wheel_link_left", "wheel_link_right")
         }
-        status = solver_status()
-        if status.backend != "C":
-            self.backend_warning = f"C backend unavailable: {status.message}"
+        self.link_half_widths = {
+            name: self._compute_link_half_width(name, scale, 0.015 * scale)
+            for name in ("wheel_link_left", "wheel_link_right")
+        }
+
+    def _joint_angles(self) -> np.ndarray:
+        angles = self.joint_angle_array
+        angles.fill(0.0)
+        angles[JOINT_ANGLE_INDEX["thigh_joint_right_1"]] = math.radians(self.angles_deg["right_thigh_a_deg"])
+        angles[JOINT_ANGLE_INDEX["calf_joint_right_1"]] = math.radians(self.angles_deg["right_calf_a_deg"])
+        angles[JOINT_ANGLE_INDEX["thigh_joint_right_2"]] = math.radians(self.angles_deg["right_thigh_b_deg"])
+        angles[JOINT_ANGLE_INDEX["calf_joint_right_2"]] = math.radians(self.angles_deg["right_calf_b_deg"])
+        angles[JOINT_ANGLE_INDEX["thigh_joint_left_1"]] = math.radians(self.angles_deg["left_thigh_a_deg"])
+        angles[JOINT_ANGLE_INDEX["calf_joint_left_1"]] = math.radians(self.angles_deg["left_calf_a_deg"])
+        angles[JOINT_ANGLE_INDEX["thigh_joint_left_2"]] = math.radians(self.angles_deg["left_thigh_b_deg"])
+        angles[JOINT_ANGLE_INDEX["calf_joint_left_2"]] = math.radians(self.angles_deg["left_calf_b_deg"])
+
+        if self.solver_status.backend != "C":
+            self.backend_warning = f"C backend unavailable: {self.solver_status.message}"
             return angles
         self.backend_warning = ""
         dirty = set(self.solve_dirty_sides)
         if "right" in dirty:
-            a, b, err = self._solve_side(angles, "right", np.array([-0.18, -0.03, 0.0]))
-            angles["calf_joint_right_1"] = a
-            angles["calf_joint_right_2"] = b
+            a, b, err = self._solve_side(angles, "right", LOOP_OFFSETS["right"])
+            angles[JOINT_ANGLE_INDEX["calf_joint_right_1"]] = a
+            angles[JOINT_ANGLE_INDEX["calf_joint_right_2"]] = b
             self.angles_deg["right_calf_a_deg"] = round(math.degrees(a), 3)
             self.angles_deg["right_calf_b_deg"] = round(math.degrees(b), 3)
             self.last_closure_error["right"] = err
         if "left" in dirty:
-            a, b, err = self._solve_side(angles, "left", np.array([-0.18, 0.03, 0.0]))
-            angles["calf_joint_left_1"] = a
-            angles["calf_joint_left_2"] = b
+            a, b, err = self._solve_side(angles, "left", LOOP_OFFSETS["left"])
+            angles[JOINT_ANGLE_INDEX["calf_joint_left_1"]] = a
+            angles[JOINT_ANGLE_INDEX["calf_joint_left_2"]] = b
             self.angles_deg["left_calf_a_deg"] = round(math.degrees(a), 3)
             self.angles_deg["left_calf_b_deg"] = round(math.degrees(b), 3)
             self.last_closure_error["left"] = err
         self.solve_dirty_sides.difference_update(dirty)
         return angles
 
-    def _solve_side(self, base_angles: dict[str, float], side: str, loop_origin: np.ndarray) -> tuple[float, float, float]:
-        angles = np.asarray([base_angles[name] for name in JOINT_ANGLE_NAMES], dtype=np.float64)
+    def _solve_side(self, angles: np.ndarray, side: str, loop_origin: np.ndarray) -> tuple[float, float, float]:
+        passive_a_index = JOINT_ANGLE_INDEX[f"calf_joint_{side}_1"]
+        passive_b_index = JOINT_ANGLE_INDEX[f"calf_joint_{side}_2"]
         return solve_passive_pair(
             self._solver_chain(f"wheel_link_{side}"),
             self._solver_chain(f"calf_{side}_link_2"),
             angles,
-            passive_a_index=JOINT_ANGLE_INDEX[f"calf_joint_{side}_1"],
-            passive_b_index=JOINT_ANGLE_INDEX[f"calf_joint_{side}_2"],
+            passive_a_index=passive_a_index,
+            passive_b_index=passive_b_index,
             loop_origin=loop_origin,
-            initial_a=base_angles[f"calf_joint_{side}_1"],
-            initial_b=base_angles[f"calf_joint_{side}_2"],
+            initial_a=float(angles[passive_a_index]),
+            initial_b=float(angles[passive_b_index]),
             lower=math.radians(-90.0),
             upper=math.radians(90.0),
         )
@@ -371,18 +403,17 @@ class RobotEngine:
         support_origin: Vec3,
         requested_root_rotation: np.ndarray,
         scale: float,
-        joint_angles: dict[str, float],
+        joint_angles: np.ndarray,
     ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         if self.urdf is None:
             return {}
-        angles = np.asarray([joint_angles[name] for name in JOINT_ANGLE_NAMES], dtype=np.float64)
         wheel_radius = max(
-            self._link_radius("wheel_link_left", scale, 0.045 * scale),
-            self._link_radius("wheel_link_right", scale, 0.045 * scale),
+            self.link_radii.get("wheel_link_left", 0.045 * scale),
+            self.link_radii.get("wheel_link_right", 0.045 * scale),
         )
         origins, rotations = compute_supported_link_transforms(
             self.tree_steps,
-            angles,
+            joint_angles,
             support_origin,
             requested_root_rotation,
             scale,
@@ -394,6 +425,9 @@ class RobotEngine:
         return {name: (origins[index], rotations[index]) for index, name in enumerate(self.link_order)}
 
     def _link_radius(self, link_name: str, scale: float, fallback: float) -> float:
+        return self.link_radii.get(link_name) or self._compute_link_radius(link_name, scale, fallback)
+
+    def _compute_link_radius(self, link_name: str, scale: float, fallback: float) -> float:
         if self.urdf is None:
             return fallback
         link = self.urdf.links.get(link_name)
@@ -402,15 +436,23 @@ class RobotEngine:
         extents = np.maximum((link.visuals[0].bounds_max - link.visuals[0].bounds_min) * scale, 1e-5)
         return max(float(extents[0]), float(extents[2])) * 0.5
 
+    def _link_half_width(self, link_name: str, scale: float, fallback: float) -> float:
+        return self.link_half_widths.get(link_name) or self._compute_link_half_width(link_name, scale, fallback)
+
+    def _compute_link_half_width(self, link_name: str, scale: float, fallback: float) -> float:
+        if self.urdf is None:
+            return fallback
+        link = self.urdf.links.get(link_name)
+        if link is None or not link.visuals:
+            return fallback
+        extents = np.maximum((link.visuals[0].bounds_max - link.visuals[0].bounds_min) * scale, 1e-5)
+        return float(extents[1]) * 0.5
+
     def _linkage_scene(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> dict:
         lines: list[dict] = []
         points: list[dict] = []
         wheels: list[dict] = []
-        loop_offsets = {
-            "right": np.array([-0.18, -0.03, 0.0], dtype=float),
-            "left": np.array([-0.18, 0.03, 0.0], dtype=float),
-        }
-        for side, color, point_color in (("right", "#d9e2ef", "#5ea0ff"), ("left", "#8fa0b7", "#2dd4bf")):
+        for side, color, point_color in (("right", "#c9d1d9", "#58a6ff"), ("left", "#8b949e", "#3fb950")):
             required = {
                 "A1": f"thigh_{side}_1",
                 "A2": f"thigh_{side}_2",
@@ -421,9 +463,12 @@ class RobotEngine:
             if any(name not in transforms for name in required.values()):
                 continue
             pts = {label: transforms[name][0] for label, name in required.items()}
-            b2_tip = pts["B2"] + (loop_offsets[side] * scale) @ transforms[required["B2"]][1].T
+            b2_tip = pts["B2"] + (LOOP_OFFSETS[side] * scale) @ transforms[required["B2"]][1].T
+            wheel_rotation = transforms[required["P"]][1]
+            wheel_radius = self._link_radius(required["P"], scale, 0.045 * scale)
+            wheel_half_width = self._link_half_width(required["P"], scale, 0.015 * scale)
             for a, b, line_color, width in (
-                ("A1", "A2", "#566274", 2.0),
+                ("A1", "A2", "#6e7681", 2.0),
                 ("A1", "B1", color, 4.0),
                 ("A2", "B2", color, 4.0),
                 ("B1", "P", color, 4.0),
@@ -432,13 +477,25 @@ class RobotEngine:
             lines.append({"a": serial_vec(pts["B2"]), "b": serial_vec(b2_tip), "color": color, "width": 4.0})
             closure_gap = float(np.linalg.norm(pts["P"] - b2_tip))
             if closure_gap > 1e-5:
-                lines.append({"a": serial_vec(b2_tip), "b": serial_vec(pts["P"]), "color": "#f87171", "width": 1.5})
+                lines.append({"a": serial_vec(b2_tip), "b": serial_vec(pts["P"]), "color": "#f85149", "width": 1.5})
             for label in ("A1", "A2", "B1", "B2", "P"):
-                points.append({"p": serial_vec(pts[label]), "label": label, "side": side, "color": point_color if label == "P" else "#9aa6b6"})
-            wheels.append({"center": serial_vec(pts["P"]), "radius": self._link_radius(required["P"], scale, 0.045 * scale), "color": "#d7dee8"})
+                points.append({"p": serial_vec(pts[label]), "label": label, "side": side, "color": point_color if label == "P" else "#8b949e"})
+            contact = wheel_contact_point(pts["P"], wheel_rotation, wheel_radius)
+            wheels.append(
+                {
+                    "center": serial_vec(pts["P"]),
+                    "contact": serial_vec(contact),
+                    "radius": wheel_radius,
+                    "halfWidth": wheel_half_width,
+                    "axisX": serial_axis(wheel_rotation, 0),
+                    "axisY": serial_axis(wheel_rotation, 1),
+                    "axisZ": serial_axis(wheel_rotation, 2),
+                    "color": "#c9d1d9",
+                }
+            )
 
         balance = self._balance_plane(transforms, scale)
-        grid = self._reference_grid(transforms)
+        grid = self._reference_grid(transforms, wheels)
         return {"lines": lines, "points": points, "wheels": wheels, "balance": balance, "grid": grid}
 
     def _balance_plane(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> dict | None:
@@ -451,13 +508,14 @@ class RobotEngine:
         corners, center, pitch, roll, tilt = solved
         return {"corners": [serial_vec(p) for p in corners], "center": serial_vec(center), "pitch": pitch, "roll": roll, "tilt": tilt}
 
-    def _reference_grid(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]]) -> list[dict]:
+    def _reference_grid(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], wheels: list[dict]) -> list[dict]:
         points = np.asarray([origin for origin, _rotation in transforms.values()])
         if len(points) == 0:
             return []
         mins = points.min(axis=0)
         maxs = points.max(axis=0)
-        z = float(mins[2] - 0.015)
+        contact_z_values = [float(wheel["contact"][2]) for wheel in wheels if "contact" in wheel]
+        z = min(contact_z_values) if contact_z_values else float(mins[2] - 0.015)
         step = max(0.05, float(np.linalg.norm(maxs[:2] - mins[:2])) / 8.0)
         x0, x1 = float(mins[0] - step), float(maxs[0] + step)
         y0, y1 = float(mins[1] - step), float(maxs[1] + step)
