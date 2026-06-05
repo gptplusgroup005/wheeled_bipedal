@@ -8,12 +8,10 @@ from pathlib import Path
 import numpy as np
 
 from fivebar_solver import (
-    compute_balance_plane,
-    compute_supported_link_transforms,
     load_stl_bounds,
     make_step,
     make_tree_step,
-    solve_passive_pair,
+    solve_robot_state,
     solver_status,
 )
 
@@ -201,6 +199,7 @@ class RobotEngine:
         self.link_order: list[str] = []
         self.link_index: dict[str, int] = {}
         self.tree_steps = np.empty((0, 13), dtype=np.float64)
+        self.balance_indices = np.full(4, -1, dtype=np.int32)
         self.solver_chains: dict[str, np.ndarray] = {}
         self.solver_status = solver_status()
         self.joint_angle_array = np.zeros(len(JOINT_ANGLE_NAMES), dtype=np.float64)
@@ -219,6 +218,7 @@ class RobotEngine:
         self.solve_dirty_sides: set[str] = {"left", "right"}
         self.last_closure_error = {"left": 0.0, "right": 0.0}
         self.backend_warning = ""
+        self.scene_cache: dict | None = None
         self.load()
 
     def load(self) -> None:
@@ -235,34 +235,42 @@ class RobotEngine:
             self.urdf_error = f"URDF load failed: {exc}"
 
     def update_angles(self, values: dict[str, float]) -> dict:
+        changed = False
         for key, value in values.items():
             if key in self.angles_deg:
-                self.angles_deg[key] = float(value)
+                new_value = float(value)
+                if abs(self.angles_deg[key] - new_value) < 1e-9:
+                    continue
+                self.angles_deg[key] = new_value
+                changed = True
                 if key.startswith("left_thigh"):
                     self.solve_dirty_sides.add("left")
                 elif key.startswith("right_thigh"):
                     self.solve_dirty_sides.add("right")
+        if not changed and self.scene_cache is not None:
+            return self.scene_cache
         return self.scene()
 
     def reset_angles(self) -> dict:
         for key in self.angles_deg:
             self.angles_deg[key] = 0.0
         self.solve_dirty_sides = {"left", "right"}
+        self.scene_cache = None
         return self.scene()
 
     def scene(self) -> dict:
         if self.urdf is None:
             return {"ok": False, "error": self.urdf_error, "camera": DEFAULT_CAMERA}
-        joint_angles = self._joint_angles()
-        transforms = self._supported_link_transforms(ZERO_VEC3, ROOT_ROTATION, SCENE_SCALE, joint_angles)
-        return {
+        joint_angles = self._active_joint_angles()
+        transforms, balance = self._solve_state(joint_angles)
+        scene = {
             "ok": True,
             "camera": DEFAULT_CAMERA,
             "solver": self.solver_status.__dict__,
             "warning": self.backend_warning,
             "angles": self.angles_deg,
             "closure": self.last_closure_error,
-            "linkage": self._linkage_scene(transforms, SCENE_SCALE),
+            "linkage": self._linkage_scene(transforms, SCENE_SCALE, balance),
             "meta": {
                 "urdf": self.urdf.name,
                 "root": self.urdf.root_link,
@@ -272,6 +280,8 @@ class RobotEngine:
                 "triangles": self.urdf.triangle_count,
             },
         }
+        self.scene_cache = scene
+        return scene
 
     def _prepare_c_kinematics(self) -> None:
         if self.urdf is None:
@@ -293,6 +303,10 @@ class RobotEngine:
                 order.append(name)
         self.link_order = order
         self.link_index = {name: index for index, name in enumerate(order)}
+        self.balance_indices = np.asarray(
+            [self.link_index.get(name, -1) for name in ("thigh_right_1", "thigh_right_2", "thigh_left_1", "thigh_left_2")],
+            dtype=np.int32,
+        )
         steps = [
             make_tree_step(
                 self.link_index[joint.parent],
@@ -320,7 +334,7 @@ class RobotEngine:
             for name in ("wheel_link_left", "wheel_link_right")
         }
 
-    def _joint_angles(self) -> np.ndarray:
+    def _active_joint_angles(self) -> np.ndarray:
         angles = self.joint_angle_array
         angles.fill(0.0)
         angles[JOINT_ANGLE_INDEX["thigh_joint_right_1"]] = math.radians(self.angles_deg["right_thigh_a_deg"])
@@ -331,44 +345,65 @@ class RobotEngine:
         angles[JOINT_ANGLE_INDEX["calf_joint_left_1"]] = math.radians(self.angles_deg["left_calf_a_deg"])
         angles[JOINT_ANGLE_INDEX["thigh_joint_left_2"]] = math.radians(self.angles_deg["left_thigh_b_deg"])
         angles[JOINT_ANGLE_INDEX["calf_joint_left_2"]] = math.radians(self.angles_deg["left_calf_b_deg"])
-
-        if self.solver_status.backend != "C":
-            self.backend_warning = f"C backend unavailable: {self.solver_status.message}"
-            return angles
-        self.backend_warning = ""
-        dirty = set(self.solve_dirty_sides)
-        if "right" in dirty:
-            a, b, err = self._solve_side(angles, "right", LOOP_OFFSETS["right"])
-            angles[JOINT_ANGLE_INDEX["calf_joint_right_1"]] = a
-            angles[JOINT_ANGLE_INDEX["calf_joint_right_2"]] = b
-            self.angles_deg["right_calf_a_deg"] = round(math.degrees(a), 3)
-            self.angles_deg["right_calf_b_deg"] = round(math.degrees(b), 3)
-            self.last_closure_error["right"] = err
-        if "left" in dirty:
-            a, b, err = self._solve_side(angles, "left", LOOP_OFFSETS["left"])
-            angles[JOINT_ANGLE_INDEX["calf_joint_left_1"]] = a
-            angles[JOINT_ANGLE_INDEX["calf_joint_left_2"]] = b
-            self.angles_deg["left_calf_a_deg"] = round(math.degrees(a), 3)
-            self.angles_deg["left_calf_b_deg"] = round(math.degrees(b), 3)
-            self.last_closure_error["left"] = err
-        self.solve_dirty_sides.difference_update(dirty)
         return angles
 
-    def _solve_side(self, angles: np.ndarray, side: str, loop_origin: np.ndarray) -> tuple[float, float, float]:
-        passive_a_index = JOINT_ANGLE_INDEX[f"calf_joint_{side}_1"]
-        passive_b_index = JOINT_ANGLE_INDEX[f"calf_joint_{side}_2"]
-        return solve_passive_pair(
-            self._solver_chain(f"wheel_link_{side}"),
-            self._solver_chain(f"calf_{side}_link_2"),
-            angles,
-            passive_a_index=passive_a_index,
-            passive_b_index=passive_b_index,
-            loop_origin=loop_origin,
-            initial_a=float(angles[passive_a_index]),
-            initial_b=float(angles[passive_b_index]),
-            lower=math.radians(-90.0),
-            upper=math.radians(90.0),
+    def _solve_state(self, angles: np.ndarray) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict | None]:
+        if self.urdf is None:
+            return {}, None
+        if self.solver_status.backend != "C":
+            self.backend_warning = f"C backend unavailable: {self.solver_status.message}"
+            return {}, None
+
+        self.backend_warning = ""
+        dirty = set(self.solve_dirty_sides)
+        wheel_radius = max(
+            self.link_radii.get("wheel_link_left", 0.045 * SCENE_SCALE),
+            self.link_radii.get("wheel_link_right", 0.045 * SCENE_SCALE),
         )
+        solved_angles, origins, rotations, closure, balance_result = solve_robot_state(
+            self.tree_steps,
+            self._solver_chain("wheel_link_right"),
+            self._solver_chain("calf_right_link_2"),
+            self._solver_chain("wheel_link_left"),
+            self._solver_chain("calf_left_link_2"),
+            angles,
+            "right" in dirty,
+            "left" in dirty,
+            JOINT_ANGLE_INDEX["calf_joint_right_1"],
+            JOINT_ANGLE_INDEX["calf_joint_right_2"],
+            JOINT_ANGLE_INDEX["calf_joint_left_1"],
+            JOINT_ANGLE_INDEX["calf_joint_left_2"],
+            LOOP_OFFSETS["right"],
+            LOOP_OFFSETS["left"],
+            ZERO_VEC3,
+            ROOT_ROTATION,
+            SCENE_SCALE,
+            len(self.link_order),
+            self.link_index["wheel_link_left"],
+            self.link_index["wheel_link_right"],
+            wheel_radius,
+            self.balance_indices,
+        )
+        self.joint_angle_array[:] = solved_angles
+        if "right" in dirty:
+            self.angles_deg["right_calf_a_deg"] = round(math.degrees(float(solved_angles[JOINT_ANGLE_INDEX["calf_joint_right_1"]])), 3)
+            self.angles_deg["right_calf_b_deg"] = round(math.degrees(float(solved_angles[JOINT_ANGLE_INDEX["calf_joint_right_2"]])), 3)
+            if closure[1] >= 0.0:
+                self.last_closure_error["right"] = closure[1]
+        if "left" in dirty:
+            self.angles_deg["left_calf_a_deg"] = round(math.degrees(float(solved_angles[JOINT_ANGLE_INDEX["calf_joint_left_1"]])), 3)
+            self.angles_deg["left_calf_b_deg"] = round(math.degrees(float(solved_angles[JOINT_ANGLE_INDEX["calf_joint_left_2"]])), 3)
+            if closure[0] >= 0.0:
+                self.last_closure_error["left"] = closure[0]
+        self.solve_dirty_sides.difference_update(dirty)
+        transforms = {name: (origins[index], rotations[index]) for index, name in enumerate(self.link_order)}
+        return transforms, self._serial_balance(balance_result)
+
+    def _serial_balance(self, solved: tuple[np.ndarray, np.ndarray, float, float, float] | None) -> dict | None:
+        if solved is None:
+            return None
+        corners, center, pitch, roll, tilt = solved
+        return {"corners": [serial_vec(p) for p in corners], "center": serial_vec(center), "pitch": pitch, "roll": roll, "tilt": tilt}
 
     def _solver_chain(self, target_link: str) -> np.ndarray:
         if target_link in self.solver_chains:
@@ -398,32 +433,6 @@ class RobotEngine:
         self.solver_chains[target_link] = chain
         return chain
 
-    def _supported_link_transforms(
-        self,
-        support_origin: Vec3,
-        requested_root_rotation: np.ndarray,
-        scale: float,
-        joint_angles: np.ndarray,
-    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        if self.urdf is None:
-            return {}
-        wheel_radius = max(
-            self.link_radii.get("wheel_link_left", 0.045 * scale),
-            self.link_radii.get("wheel_link_right", 0.045 * scale),
-        )
-        origins, rotations = compute_supported_link_transforms(
-            self.tree_steps,
-            joint_angles,
-            support_origin,
-            requested_root_rotation,
-            scale,
-            len(self.link_order),
-            self.link_index["wheel_link_left"],
-            self.link_index["wheel_link_right"],
-            wheel_radius,
-        )
-        return {name: (origins[index], rotations[index]) for index, name in enumerate(self.link_order)}
-
     def _link_radius(self, link_name: str, scale: float, fallback: float) -> float:
         return self.link_radii.get(link_name) or self._compute_link_radius(link_name, scale, fallback)
 
@@ -448,7 +457,7 @@ class RobotEngine:
         extents = np.maximum((link.visuals[0].bounds_max - link.visuals[0].bounds_min) * scale, 1e-5)
         return float(extents[1]) * 0.5
 
-    def _linkage_scene(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> dict:
+    def _linkage_scene(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float, balance: dict | None = None) -> dict:
         lines: list[dict] = []
         points: list[dict] = []
         wheels: list[dict] = []
@@ -494,19 +503,8 @@ class RobotEngine:
                 }
             )
 
-        balance = self._balance_plane(transforms, scale)
         grid = self._reference_grid(transforms, wheels)
         return {"lines": lines, "points": points, "wheels": wheels, "balance": balance, "grid": grid}
-
-    def _balance_plane(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], scale: float) -> dict | None:
-        names = ("thigh_right_1", "thigh_right_2", "thigh_left_1", "thigh_left_2")
-        if any(name not in transforms for name in names):
-            return None
-        solved = compute_balance_plane(np.asarray([transforms[name][0] for name in names], dtype=np.float64), scale)
-        if solved is None:
-            return None
-        corners, center, pitch, roll, tilt = solved
-        return {"corners": [serial_vec(p) for p in corners], "center": serial_vec(center), "pitch": pitch, "roll": roll, "tilt": tilt}
 
     def _reference_grid(self, transforms: dict[str, tuple[np.ndarray, np.ndarray]], wheels: list[dict]) -> list[dict]:
         points = np.asarray([origin for origin, _rotation in transforms.values()])

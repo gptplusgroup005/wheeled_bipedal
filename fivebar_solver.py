@@ -10,6 +10,8 @@ import numpy as np
 
 STEP_WIDTH = 16
 TREE_STEP_WIDTH = 13
+DOUBLE_PTR = ctypes.POINTER(ctypes.c_double)
+INT_PTR = ctypes.POINTER(ctypes.c_int)
 
 @dataclass(frozen=True)
 class SolverStatus:
@@ -213,6 +215,103 @@ def compute_balance_plane(anchors: np.ndarray, scale: float) -> tuple[np.ndarray
         return None
     return out[:12].reshape(4, 3), out[12:15].copy(), float(out[15]), float(out[16]), float(out[17])
 
+def solve_robot_state(
+    tree_steps: np.ndarray,
+    wheel_right_chain: np.ndarray,
+    branch_right_chain: np.ndarray,
+    wheel_left_chain: np.ndarray,
+    branch_left_chain: np.ndarray,
+    angles: np.ndarray,
+    dirty_right: bool,
+    dirty_left: bool,
+    right_passive_a: int,
+    right_passive_b: int,
+    left_passive_a: int,
+    left_passive_b: int,
+    right_loop_origin: np.ndarray,
+    left_loop_origin: np.ndarray,
+    support_origin: np.ndarray,
+    requested_root_rotation: np.ndarray,
+    scale: float,
+    link_count: int,
+    wheel_left_index: int,
+    wheel_right_index: int,
+    wheel_radius: float,
+    balance_indices: np.ndarray,
+    lower: float = -math.pi / 2.0,
+    upper: float = math.pi / 2.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[float, float], tuple[np.ndarray, np.ndarray, float, float, float] | None]:
+    tree_steps = _as_tree_steps(tree_steps)
+    wheel_right_chain = _as_chain(wheel_right_chain)
+    branch_right_chain = _as_chain(branch_right_chain)
+    wheel_left_chain = _as_chain(wheel_left_chain)
+    branch_left_chain = _as_chain(branch_left_chain)
+    angles = np.ascontiguousarray(np.asarray(angles, dtype=np.float64))
+    right_loop_origin = np.asarray(right_loop_origin, dtype=np.float64)
+    left_loop_origin = np.asarray(left_loop_origin, dtype=np.float64)
+    support_origin = np.asarray(support_origin, dtype=np.float64)
+    requested_root_rotation = np.ascontiguousarray(np.asarray(requested_root_rotation, dtype=np.float64).reshape(9))
+    balance_indices = np.ascontiguousarray(np.asarray(balance_indices, dtype=np.int32).reshape(4))
+    origins = np.zeros((link_count, 3), dtype=np.float64)
+    rotations = np.zeros((link_count, 3, 3), dtype=np.float64)
+    closure = np.zeros(2, dtype=np.float64)
+    balance = np.zeros(18, dtype=np.float64)
+    balance_ok = ctypes.c_int()
+
+    lib = _load_c_solver()
+    if lib is None:
+        raise RuntimeError(f"C backend is required for robot state solve: {_STATUS.message}")
+
+    ok = lib.solve_robot_state_c(
+        tree_steps.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_int(len(tree_steps)),
+        wheel_right_chain.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_int(len(wheel_right_chain)),
+        branch_right_chain.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_int(len(branch_right_chain)),
+        wheel_left_chain.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_int(len(wheel_left_chain)),
+        branch_left_chain.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_int(len(branch_left_chain)),
+        angles.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_int(len(angles)),
+        ctypes.c_int(1 if dirty_right else 0),
+        ctypes.c_int(1 if dirty_left else 0),
+        ctypes.c_int(right_passive_a),
+        ctypes.c_int(right_passive_b),
+        ctypes.c_int(left_passive_a),
+        ctypes.c_int(left_passive_b),
+        right_loop_origin.ctypes.data_as(DOUBLE_PTR),
+        left_loop_origin.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_double(lower),
+        ctypes.c_double(upper),
+        support_origin.ctypes.data_as(DOUBLE_PTR),
+        requested_root_rotation.ctypes.data_as(DOUBLE_PTR),
+        ctypes.c_double(scale),
+        ctypes.c_int(link_count),
+        ctypes.c_int(wheel_left_index),
+        ctypes.c_int(wheel_right_index),
+        ctypes.c_double(wheel_radius),
+        balance_indices.ctypes.data_as(INT_PTR),
+        origins.ctypes.data_as(DOUBLE_PTR),
+        rotations.ctypes.data_as(DOUBLE_PTR),
+        closure.ctypes.data_as(DOUBLE_PTR),
+        balance.ctypes.data_as(DOUBLE_PTR),
+        ctypes.byref(balance_ok),
+    )
+    if not ok:
+        raise RuntimeError("C backend failed to solve robot state")
+    balance_result = None
+    if balance_ok.value:
+        balance_result = (
+            balance[:12].reshape(4, 3),
+            balance[12:15].copy(),
+            float(balance[15]),
+            float(balance[16]),
+            float(balance[17]),
+        )
+    return angles, origins, rotations, (float(closure[0]), float(closure[1])), balance_result
+
 def _as_chain(chain: np.ndarray) -> np.ndarray:
     arr = np.asarray(chain, dtype=np.float64)
     if arr.size == 0:
@@ -250,64 +349,102 @@ def _load_c_solver() -> ctypes.CDLL | None:
     try:
         lib = ctypes.CDLL(str(library))
         lib.solve_passive_pair_c.argtypes = [
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_double,
             ctypes.c_double,
             ctypes.c_double,
             ctypes.c_double,
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
         ]
         lib.solve_passive_pair_c.restype = ctypes.c_int
         lib.compute_link_transforms_c.argtypes = [
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
+            DOUBLE_PTR,
             ctypes.c_double,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
+            DOUBLE_PTR,
         ]
         lib.compute_link_transforms_c.restype = ctypes.c_int
         lib.compute_supported_link_transforms_c.argtypes = [
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
+            DOUBLE_PTR,
             ctypes.c_double,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_double,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
+            DOUBLE_PTR,
         ]
         lib.compute_supported_link_transforms_c.restype = ctypes.c_int
         lib.load_stl_bounds_c.argtypes = [
             ctypes.c_char_p,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_int),
+            DOUBLE_PTR,
+            DOUBLE_PTR,
+            INT_PTR,
         ]
         lib.load_stl_bounds_c.restype = ctypes.c_int
         lib.compute_balance_plane_c.argtypes = [
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
             ctypes.c_double,
-            ctypes.POINTER(ctypes.c_double),
+            DOUBLE_PTR,
         ]
         lib.compute_balance_plane_c.restype = ctypes.c_int
+        lib.solve_robot_state_c.argtypes = [
+            DOUBLE_PTR,
+            ctypes.c_int,
+            DOUBLE_PTR,
+            ctypes.c_int,
+            DOUBLE_PTR,
+            ctypes.c_int,
+            DOUBLE_PTR,
+            ctypes.c_int,
+            DOUBLE_PTR,
+            ctypes.c_int,
+            DOUBLE_PTR,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            DOUBLE_PTR,
+            DOUBLE_PTR,
+            ctypes.c_double,
+            ctypes.c_double,
+            DOUBLE_PTR,
+            DOUBLE_PTR,
+            ctypes.c_double,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_double,
+            INT_PTR,
+            DOUBLE_PTR,
+            DOUBLE_PTR,
+            DOUBLE_PTR,
+            DOUBLE_PTR,
+            INT_PTR,
+        ]
+        lib.solve_robot_state_c.restype = ctypes.c_int
         _LIB = lib
         _STATUS = SolverStatus("C", str(library))
         return _LIB

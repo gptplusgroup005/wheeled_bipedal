@@ -31,11 +31,18 @@ const colors = {
   triadBg: "#0d1117",
 };
 
+const wheelUnitCircle = Array.from({ length: 45 }, (_, index) => {
+  const t = (index / 44) * Math.PI * 2;
+  return [Math.cos(t), Math.sin(t)];
+});
+
 let scene = null;
+let sceneCenterCache = null;
 let camera = { mode: "ISO", ...cameraPresets.ISO };
 let dragging = null;
 let framePending = false;
 let updateInFlight = false;
+let updateScheduled = false;
 let pendingAngleValues = {};
 
 function degToRad(value) {
@@ -118,18 +125,21 @@ function resizeCanvas(canvas) {
   const dpr = window.devicePixelRatio || 1;
   const width = Math.max(1, Math.round(rect.width * dpr));
   const height = Math.max(1, Math.round(rect.height * dpr));
-  if (canvas.width !== width || canvas.height !== height) {
+  if (canvas.width !== width || canvas.height !== height || canvas.dataset.dpr !== String(dpr)) {
     canvas.width = width;
     canvas.height = height;
+    canvas.dataset.dpr = String(dpr);
+    canvas.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
   }
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return rect;
 }
 
 function drawLine(ctx, a, b, style) {
-  ctx.save();
-  ctx.globalAlpha = style.alpha ?? 1;
+  const hasAlpha = style.alpha !== undefined && style.alpha < 1;
+  if (hasAlpha) {
+    ctx.save();
+    ctx.globalAlpha = style.alpha;
+  }
   ctx.strokeStyle = style.color;
   ctx.lineWidth = style.width;
   ctx.lineCap = "round";
@@ -137,7 +147,7 @@ function drawLine(ctx, a, b, style) {
   ctx.moveTo(a.x, a.y);
   ctx.lineTo(b.x, b.y);
   ctx.stroke();
-  ctx.restore();
+  if (hasAlpha) ctx.restore();
 }
 
 function wheelPoint(wheel, cosValue, sinValue, axialOffset = 0) {
@@ -150,7 +160,6 @@ function wheelPoint(wheel, cosValue, sinValue, axialOffset = 0) {
 }
 
 function drawProjectedRing(ctx, wheel, projected, axialOffset, color, width, alpha = 1) {
-  const segments = 44;
   ctx.save();
   ctx.globalAlpha = alpha;
   ctx.strokeStyle = color;
@@ -158,9 +167,9 @@ function drawProjectedRing(ctx, wheel, projected, axialOffset, color, width, alp
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.beginPath();
-  for (let i = 0; i <= segments; i += 1) {
-    const t = (i / segments) * Math.PI * 2;
-    const p = projected(wheelPoint(wheel, Math.cos(t), Math.sin(t), axialOffset));
+  for (let i = 0; i < wheelUnitCircle.length; i += 1) {
+    const [cosValue, sinValue] = wheelUnitCircle[i];
+    const p = projected(wheelPoint(wheel, cosValue, sinValue, axialOffset));
     if (i === 0) ctx.moveTo(p.x, p.y);
     else ctx.lineTo(p.x, p.y);
   }
@@ -238,7 +247,7 @@ function drawSceneNow() {
   if (!scene || !scene.ok) return;
 
   const linkage = scene.linkage;
-  const center = sceneCenter(linkage);
+  const center = sceneCenterCache || sceneCenter(linkage);
   const span = camera.span;
   const projected = makeProjector(rect.width, rect.height, center, span);
 
@@ -293,6 +302,11 @@ function drawSceneNow() {
 
   drawTriad();
   updateTelemetry();
+}
+
+function setScene(nextScene) {
+  scene = nextScene;
+  sceneCenterCache = scene?.ok ? sceneCenter(scene.linkage) : null;
 }
 
 function drawTriad() {
@@ -371,7 +385,7 @@ function syncAngles(angles) {
 }
 
 async function refresh() {
-  scene = await window.pywebview.api.get_scene();
+  setScene(await window.pywebview.api.get_scene());
   if (scene.ok) syncAngles(scene.angles);
   drawScene();
 }
@@ -382,18 +396,27 @@ async function flushAngleUpdates() {
   pendingAngleValues = {};
   updateInFlight = true;
   try {
-    scene = await window.pywebview.api.update_angles(values);
+    setScene(await window.pywebview.api.update_angles(values));
     if (scene.ok) syncAngles(scene.angles);
     drawScene();
   } finally {
     updateInFlight = false;
-    if (Object.keys(pendingAngleValues).length) flushAngleUpdates();
+    if (Object.keys(pendingAngleValues).length) scheduleAngleFlush();
   }
+}
+
+function scheduleAngleFlush() {
+  if (updateScheduled) return;
+  updateScheduled = true;
+  requestAnimationFrame(() => {
+    updateScheduled = false;
+    flushAngleUpdates();
+  });
 }
 
 function updateJoint(key, value) {
   pendingAngleValues[key] = Number(value);
-  flushAngleUpdates();
+  scheduleAngleFlush();
 }
 
 function wireControls() {
@@ -411,7 +434,7 @@ function wireControls() {
     number.addEventListener("change", () => apply(number.value));
   }
   document.getElementById("resetAngles").addEventListener("click", async () => {
-    scene = await window.pywebview.api.reset_angles();
+    setScene(await window.pywebview.api.reset_angles());
     if (scene.ok) syncAngles(scene.angles);
     drawScene();
   });

@@ -596,7 +596,7 @@ static int compute_tree_transforms(
     out_origins[0] = root_origin[0];
     out_origins[1] = root_origin[1];
     out_origins[2] = root_origin[2];
-    for (int j = 0; j < 9; ++j) {
+    for (int j = 0; j < 9; j++) {
         out_rotations[j] = root_rotation[j];
     }
 
@@ -764,4 +764,139 @@ int compute_supported_link_transforms_c(
         out_origins,
         out_rotations
     );
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int solve_robot_state_c(
+    const double *tree_steps,
+    int step_count,
+    const double *wheel_right_chain,
+    int wheel_right_count,
+    const double *branch_right_chain,
+    int branch_right_count,
+    const double *wheel_left_chain,
+    int wheel_left_count,
+    const double *branch_left_chain,
+    int branch_left_count,
+    double *angles,
+    int angle_count,
+    int dirty_right,
+    int dirty_left,
+    int right_passive_a,
+    int right_passive_b,
+    int left_passive_a,
+    int left_passive_b,
+    const double *right_loop_origin,
+    const double *left_loop_origin,
+    double lower,
+    double upper,
+    const double *support_origin,
+    const double *requested_root_rotation,
+    double scale,
+    int link_count,
+    int wheel_left_index,
+    int wheel_right_index,
+    double wheel_radius,
+    const int *balance_indices,
+    double *out_origins,
+    double *out_rotations,
+    double *out_closure,
+    double *out_balance,
+    int *out_balance_ok
+) {
+    if (
+        !tree_steps || !angles || !support_origin || !requested_root_rotation || !balance_indices ||
+        !out_origins || !out_rotations || !out_closure || !out_balance || !out_balance_ok ||
+        link_count <= 0 || angle_count <= 0
+    ) {
+        return 0;
+    }
+
+    out_closure[0] = -1.0;
+    out_closure[1] = -1.0;
+    *out_balance_ok = 0;
+
+    if (dirty_right) {
+        double solved[3];
+        if (!solve_passive_pair_c(
+            wheel_right_chain,
+            wheel_right_count,
+            branch_right_chain,
+            branch_right_count,
+            angles,
+            angle_count,
+            right_passive_a,
+            right_passive_b,
+            right_loop_origin,
+            angles[right_passive_a],
+            angles[right_passive_b],
+            lower,
+            upper,
+            solved
+        )) {
+            return 0;
+        }
+        angles[right_passive_a] = solved[0];
+        angles[right_passive_b] = solved[1];
+        out_closure[1] = solved[2];
+    }
+
+    if (dirty_left) {
+        double solved[3];
+        if (!solve_passive_pair_c(
+            wheel_left_chain,
+            wheel_left_count,
+            branch_left_chain,
+            branch_left_count,
+            angles,
+            angle_count,
+            left_passive_a,
+            left_passive_b,
+            left_loop_origin,
+            angles[left_passive_a],
+            angles[left_passive_b],
+            lower,
+            upper,
+            solved
+        )) {
+            return 0;
+        }
+        angles[left_passive_a] = solved[0];
+        angles[left_passive_b] = solved[1];
+        out_closure[0] = solved[2];
+    }
+
+    if (!compute_supported_link_transforms_c(
+        tree_steps,
+        step_count,
+        angles,
+        angle_count,
+        support_origin,
+        requested_root_rotation,
+        scale,
+        link_count,
+        wheel_left_index,
+        wheel_right_index,
+        wheel_radius,
+        out_origins,
+        out_rotations
+    )) {
+        return 0;
+    }
+
+    double anchors[12];
+    for (int i = 0; i < 4; ++i) {
+        int link_index = balance_indices[i];
+        if (link_index < 0 || link_index >= link_count) {
+            return 1;
+        }
+        const double *origin = out_origins + (size_t)link_index * 3;
+        anchors[i * 3 + 0] = origin[0];
+        anchors[i * 3 + 1] = origin[1];
+        anchors[i * 3 + 2] = origin[2];
+    }
+    *out_balance_ok = compute_balance_plane_c(anchors, scale, out_balance);
+    return 1;
 }
